@@ -122,6 +122,7 @@ function Sidebar:new(id)
     current_tool_use_extmark_id = nil,
     win_width_store = {},
     is_in_full_view = false,
+    is_in_fullscreen_edit = false,
   }, Sidebar)
 end
 
@@ -162,6 +163,7 @@ function Sidebar:reset()
   self.current_tool_use_extmark_id = nil
   self.win_size_store = {}
   self.is_in_full_view = false
+  self.is_in_fullscreen_edit = false
 end
 
 ---@class SidebarOpenOptions: AskOptions
@@ -193,6 +195,29 @@ function Sidebar:open(opts)
   if not vim.g.avante_login or vim.g.avante_login == false then
     api.nvim_exec_autocmds("User", { pattern = Providers.env.REQUEST_LOGIN_PATTERN })
     vim.g.avante_login = true
+  end
+
+  -- Check for saved session and offer to restore
+  if not opts.skip_session_restore then
+    vim.schedule(function()
+      local SessionManager = require("avante.session_manager")
+      if SessionManager.has_session(self.code.bufnr) then
+        local choice = vim.fn.confirm(
+          "Found a saved session for this project. Restore it?",
+          "&Yes\n&No",
+          1
+        )
+        if choice == 1 then
+          local session_state = SessionManager.load_session(self.code.bufnr)
+          if session_state then
+            SessionManager.restore_session(self, session_state)
+          end
+        else
+          -- Delete the session since user doesn't want it
+          SessionManager.delete_session(self.code.bufnr)
+        end
+      end
+    end)
   end
 
   local acp_provider = Config.acp_providers[Config.provider]
@@ -1025,6 +1050,12 @@ end
 function Sidebar:render_result()
   if not Utils.is_valid_container(self.containers.result) then return end
   local header_text = Utils.icon("󰭻 ") .. "Avante"
+  
+  -- Add plan mode indicator
+  if Config.plan_only_mode then
+    header_text = header_text .. " " .. Utils.icon(" ") .. "[PLAN]"
+  end
+  
   self:render_header(
     self.containers.result.winid,
     self.containers.result.bufnr,
@@ -1663,6 +1694,60 @@ function Sidebar:toggle_code_window()
   self.is_in_full_view = not self.is_in_full_view
 end
 
+--- Toggle full-screen mode for the currently focused container
+function Sidebar:toggle_fullscreen_edit()
+  -- Get the currently focused window
+  local current_winid = api.nvim_get_current_win()
+  local focused_container = self:get_sidebar_window(current_winid)
+
+  if not focused_container then
+    Utils.warn("No sidebar container is currently focused")
+    return
+  end
+
+  if self.is_in_fullscreen_edit then
+    -- Exit fullscreen mode: restore all hidden containers
+    self.is_in_fullscreen_edit = false
+
+    -- Restore all previously visible containers
+    if self.fullscreen_hidden_containers then
+      for container_name, container in pairs(self.fullscreen_hidden_containers) do
+        if container and Utils.is_valid_container(container) then
+          -- Remount the container
+          container:mount()
+        elseif container_name == "selected_code" then
+          self:create_selected_code_container()
+        elseif container_name == "selected_files" then
+          self:create_selected_files_container()
+        elseif container_name == "todos" then
+          self:create_todos_container()
+        end
+      end
+      self.fullscreen_hidden_containers = nil
+    end
+
+    self:adjust_layout()
+    Utils.info("Exited fullscreen mode")
+  else
+    -- Enter fullscreen mode: hide all other containers
+    self.is_in_fullscreen_edit = true
+    self.fullscreen_hidden_containers = {}
+
+    -- Hide all containers except the focused one
+    for container_name, container in pairs(self.containers) do
+      if container ~= focused_container and Utils.is_valid_container(container, true) then
+        -- Store the container before hiding it
+        self.fullscreen_hidden_containers[container_name] = container
+        -- Unmount (hide) the container
+        container:unmount()
+      end
+    end
+
+    self:adjust_layout()
+    Utils.info("Entered fullscreen mode - Run /toggle-full-screen again to exit")
+  end
+end
+
 --- Initialize the sidebar instance.
 --- @return avante.Sidebar The Sidebar instance.
 function Sidebar:initialize()
@@ -2255,7 +2340,13 @@ function Sidebar:new_chat(args, cb)
 end
 
 local debounced_save_history = Utils.debounce(
-  function(self) Path.history.save(self.code.bufnr, self.chat_history) end,
+  function(self)
+    -- Update selected files before saving
+    if self.file_selector then
+      self.chat_history.selected_files = self.file_selector:get_selected_filepaths()
+    end
+    Path.history.save(self.code.bufnr, self.chat_history)
+  end,
   1000
 )
 
@@ -2848,6 +2939,8 @@ function Sidebar:handle_submit(request)
     ---@diagnostic disable-next-line: assign-type-mismatch
     local stream_options = vim.tbl_deep_extend("force", generate_prompts_options, {
       just_connect_acp_client = request == "",
+      _load_existing_session = self._load_existing_session or false,
+      _on_session_load_complete = self._on_session_load_complete,
       on_start = on_start,
       on_stop = on_stop,
       on_tool_log = on_tool_log,
@@ -2859,6 +2952,8 @@ function Sidebar:handle_submit(request)
       on_save_acp_session_id = function(session_id)
         self.chat_history.acp_session_id = session_id
         Path.history.save(self.code.bufnr, self.chat_history)
+        -- Clear the load flag after saving
+        self._load_existing_session = false
       end,
       set_tool_use_store = set_tool_use_store,
       get_history_messages = function(opts) return self:get_history_messages_for_api(opts) end,
@@ -3150,6 +3245,7 @@ end
 
 ---@param opts AskOptions
 function Sidebar:render(opts)
+  opts = opts or {}
   self.augroup = api.nvim_create_augroup("avante_sidebar_" .. self.id, { clear = true })
 
   -- This autocommand needs to be registered first, before NuiSplit
@@ -3205,6 +3301,7 @@ function Sidebar:render(opts)
 
   self.containers.result:map("n", Config.mappings.sidebar.close, function() self:shutdown() end)
   self.containers.result:map("n", Config.mappings.sidebar.toggle_code_window, function() self:toggle_code_window() end)
+  self.containers.result:map("n", Config.mappings.sidebar.toggle_fullscreen_edit, function() self:toggle_fullscreen_edit() end)
 
   self:create_input_container()
 

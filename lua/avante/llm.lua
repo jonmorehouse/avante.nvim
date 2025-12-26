@@ -459,6 +459,18 @@ function M.generate_prompts(opts)
   local cursor_rules = Prompts.get_cursor_rules_prompt(selected_files)
   if cursor_rules then system_prompt = system_prompt .. "\n\n" .. cursor_rules end
 
+  -- Add workspace context
+  local workspace_context = "\n\n<workspace_context>\n"
+    .. "Working directory: " .. Utils.root.get() .. "\n"
+    .. "Git root: " .. Utils.root.git() .. "\n"
+    .. "</workspace_context>"
+  system_prompt = system_prompt .. workspace_context
+
+  -- Add plan mode prompt if enabled
+  if Config.plan_only_mode then
+    system_prompt = system_prompt .. "\n\n" .. Prompts.get_plan_mode_prompt()
+  end
+
   ---@type AvantePromptOptions
   return {
     system_prompt = system_prompt,
@@ -1321,7 +1333,13 @@ function M._stream_acp(opts)
         M._create_acp_session_and_continue(opts, acp_client)
       else
         if opts.just_connect_acp_client then return end
-        M._continue_stream_acp(opts, acp_client, session_id)
+        
+        -- Load existing session to sync external changes
+        if acp_client.agent_capabilities.loadSession and opts._load_existing_session then
+          M._load_and_continue_acp_session(opts, acp_client, session_id)
+        else
+          M._continue_stream_acp(opts, acp_client, session_id)
+        end
       end
     end)
     return
@@ -1331,7 +1349,13 @@ function M._stream_acp(opts)
   end
 
   if opts.just_connect_acp_client then return end
-  M._continue_stream_acp(opts, acp_client, session_id)
+  
+  -- Load existing session to sync external changes
+  if acp_client.agent_capabilities.loadSession and opts._load_existing_session then
+    M._load_and_continue_acp_session(opts, acp_client, session_id)
+  else
+    M._continue_stream_acp(opts, acp_client, session_id)
+  end
 end
 
 ---@param opts AvanteLLMStreamOptions
@@ -1355,11 +1379,59 @@ function M._create_acp_session_and_continue(opts, acp_client)
   end)
 end
 
+---Load existing ACP session and continue (to sync external changes)
+---@param opts AvanteLLMStreamOptions
+---@param acp_client avante.acp.ACPClient
+---@param session_id string
+function M._load_and_continue_acp_session(opts, acp_client, session_id)
+  local project_root = Utils.root.get()
+  Utils.info("Loading ACP session to sync external changes: " .. session_id)
+  
+  acp_client:load_session(session_id, project_root, {}, function(result, err)
+    if err then
+      Utils.warn("Failed to load ACP session: " .. vim.inspect(err))
+      -- Fall back to continuing without loading
+      M._continue_stream_acp(opts, acp_client, session_id)
+      -- Trigger callback even on error
+      if opts._on_session_load_complete then
+        vim.schedule(function()
+          opts._on_session_load_complete()
+        end)
+      end
+      return
+    end
+    
+    Utils.info("ACP session loaded successfully, synced with external changes")
+    
+    -- Mark this as session recovery to preserve context
+    opts._is_session_recovery = true
+    
+    -- Trigger callback after session load completes
+    if opts._on_session_load_complete then
+      vim.schedule(function()
+        opts._on_session_load_complete()
+      end)
+    end
+    
+    M._continue_stream_acp(opts, acp_client, session_id)
+  end)
+end
+
 ---@param opts AvanteLLMStreamOptions
 ---@param acp_client avante.acp.ACPClient
 ---@param session_id string
 function M._continue_stream_acp(opts, acp_client, session_id)
   local prompt = {}
+
+  -- Add plan mode instructions at the beginning of the prompt if enabled
+  if Config.plan_only_mode then
+    local Prompts = require("avante.utils.prompts")
+    table.insert(prompt, {
+      type = "text",
+      text = "<system_context>" .. Prompts.get_plan_mode_prompt() .. "</system_context>",
+    })
+  end
+
   local donot_use_builtin_system_prompt = opts.history_messages ~= nil and #opts.history_messages > 0
   if donot_use_builtin_system_prompt then
     if opts.selected_filepaths then
