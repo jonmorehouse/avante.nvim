@@ -186,12 +186,7 @@ function H.keymaps()
       noremap = true,
       silent = true,
     })
-    Utils.safe_keymap_set(
-      "n",
-      Config.mappings.toggle.plan_mode,
-      function() require("avante.api").toggle_plan_mode() end,
-      { desc = "avante: toggle plan mode" }
-    )
+
     Utils.safe_keymap_set(
       "n",
       Config.mappings.select_model,
@@ -203,6 +198,12 @@ function H.keymaps()
       Config.mappings.select_history,
       function() require("avante.api").select_history() end,
       { desc = "avante: select history" }
+    )
+    Utils.safe_keymap_set(
+      "n",
+      Config.mappings.select_prompt,
+      function() require("avante.api").select_prompt() end,
+      { desc = "avante: select and reuse prompt" }
     )
 
     Utils.safe_keymap_set(

@@ -31,8 +31,6 @@ M._defaults = {
   ---@alias avante.Mode "agentic" | "legacy"
   ---@type avante.Mode
   mode = "agentic",
-  ---@type boolean
-  plan_only_mode = true,  -- Default: new sessions start in plan mode
   ---@alias avante.ProviderName "claude" | "openai" | "azure" | "gemini" | "vertex" | "cohere" | "copilot" | "bedrock" | "ollama" | "watsonx_code_assistant" | string
   ---@type avante.ProviderName
   provider = "claude",
@@ -563,6 +561,10 @@ M._defaults = {
     --- Whether to automatically open files and navigate to lines when ACP agent makes edits
     ---@type boolean
     acp_follow_agent_locations = true,
+    --- Default mode to set when creating a new ACP session (e.g., "plan" for plan mode)
+    --- Set to nil to use whatever mode the ACP server defaults to
+    ---@type string|nil
+    acp_default_mode = nil,
     --- Whether to prompt before exiting when there are active ACP sessions
     ---@type boolean
     prompt_on_exit_with_active_session = true,
@@ -575,14 +577,26 @@ M._defaults = {
       show_following_status = true, -- Show following status indicator (👁️  FOLLOW or 🔕 MANUAL)
       show_tokens = true, -- Show token count
       show_submit_key = true, -- Show submit keybinding
-      show_session_info = false, -- Show session ID
+      show_session_info = true, -- Show session mode and ID
       format = nil, -- Custom format string: "{plan_mode} | {following_status} | {tokens} | {submit_key}"
     },
   },
-  prompt_logger = { -- logs prompts to disk (timestamped, for replay/debugging)
+  prompt_logger = { -- logs prompts to disk with rich metadata (per-project, searchable via telescope)
     enabled = true, -- toggle logging entirely
-    log_dir = vim.fn.stdpath("cache"), -- directory where logs are saved
-    max_entries = 100, -- the uplimit of entries that can be sotred
+    storage_path = Utils.join_paths(vim.fn.stdpath("state"), "avante"), -- base path for per-project prompt storage
+    max_entries = 100, -- max prompts per project (0 = unlimited)
+    use_index = true, -- enable index.json for fast Ctrl+N/P navigation
+    auto_rebuild_index = false, -- rebuild index on init (slower but ensures accuracy)
+    
+    -- Usage tracking options
+    track_usage = true, -- track how many times each prompt is reused
+    sort_by_usage = true, -- sort prompts by usage count first, then recency
+    show_usage_count = true, -- display usage count in selector
+    
+    -- Search options
+    search_full_prompt = true, -- search full prompt content (not just preview) in Telescope
+    max_keywords = 10, -- max keywords to extract for search optimization
+    
     next_prompt = {
       normal = "<C-n>", -- load the next (newer) prompt log in normal mode
       insert = "<C-n>",
@@ -658,10 +672,10 @@ M._defaults = {
       selection = "<leader>aC",
       suggestion = "<leader>as",
       repomap = "<leader>aR",
-      plan_mode = "<leader>ap",
     },
     sidebar = {
-      expand_tool_use = "<S-Tab>",
+      cycle_mode = "<S-Tab>",
+      expand_tool_use = "<C-e>",
       next_prompt = "]p",
       prev_prompt = "[p",
       apply_all = "A",
@@ -669,7 +683,7 @@ M._defaults = {
       retry_user_request = "r",
       edit_user_request = "e",
       switch_windows = "<Tab>",
-      reverse_switch_windows = "<S-Tab>",
+      reverse_switch_windows = "<C-S-Tab>",
       toggle_code_window = "x",
       toggle_fullscreen_edit = "<S-f>",
       toggle_input_fullscreen = "<C-f>",
@@ -689,6 +703,7 @@ M._defaults = {
     },
     select_model = "<leader>a?", -- Select model command
     select_history = "<leader>ah", -- Select history command
+    select_prompt = "<leader>ap", -- Select and reuse prompt command
     confirm = {
       focus_window = "<C-w>f",
       code = "c",
@@ -807,7 +822,7 @@ M._defaults = {
   selector = {
     ---@alias avante.SelectorProvider "native" | "fzf_lua" | "mini_pick" | "snacks" | "telescope" | fun(selector: avante.ui.Selector): nil
     ---@type avante.SelectorProvider
-    provider = "native",
+    provider = "telescope",
     provider_opts = {},
     exclude_auto_select = {}, -- List of items to exclude from auto selection
   },

@@ -86,6 +86,8 @@ Sidebar.__index = Sidebar
 ---@field current_tool_use_extmark_id integer | nil
 ---@field private win_size_store table<integer, {width: integer, height: integer}>
 ---@field is_in_full_view boolean
+---@field current_mode_id string | nil
+---@field available_modes string[]
 
 ---@param id integer the tabpage id retrieved from api.nvim_get_current_tabpage()
 function Sidebar:new(id)
@@ -105,8 +107,8 @@ function Sidebar:new(id)
     chat_history = nil,
     current_state = nil,
     state_timer = nil,
-    state_spinner_chars = Config.windows.spinner.generating,
-    thinking_spinner_chars = Config.windows.spinner.thinking,
+    state_spinner_chars = (Config.windows and Config.windows.spinner and Config.windows.spinner.generating) or { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
+    thinking_spinner_chars = (Config.windows and Config.windows.spinner and Config.windows.spinner.thinking) or { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" },
     state_spinner_idx = 1,
     state_extmark_id = nil,
     scroll = true,
@@ -123,6 +125,9 @@ function Sidebar:new(id)
     win_width_store = {},
     is_in_full_view = false,
     is_in_fullscreen_edit = false,
+    is_input_fullscreen = false,
+    current_mode_id = nil,
+    available_modes = {},
   }, Sidebar)
 end
 
@@ -164,6 +169,7 @@ function Sidebar:reset()
   self.win_size_store = {}
   self.is_in_full_view = false
   self.is_in_fullscreen_edit = false
+  self.is_input_fullscreen = false
 end
 
 ---@class SidebarOpenOptions: AskOptions
@@ -341,6 +347,132 @@ function Sidebar:toggle(opts)
     ---@cast opts SidebarOpenOptions
     self:open(opts)
     return true
+  end
+end
+
+---Initialize available modes from ACP client (no fallback)
+function Sidebar:initialize_modes()
+  if self.acp_client and self.acp_client:has_modes() then
+    -- Server provides modes
+    self.available_modes = vim.tbl_map(function(m) return m.id end, self.acp_client:all_modes())
+    self.current_mode_id = self.acp_client:current_mode()
+
+    -- Setup mode change callback
+    self.acp_client.on_mode_changed = function(mode_id)
+      vim.schedule(function()
+        self.current_mode_id = mode_id
+        self:render_result()
+        self:show_input_hint()
+        local mode = self.acp_client:mode_by_id(mode_id)
+        local mode_name = mode and mode.name or mode_id
+        Utils.info("Mode: " .. mode_name)
+      end)
+    end
+
+    Utils.debug("Initialized " .. #self.available_modes .. " modes from agent: " .. table.concat(self.available_modes, ", "))
+    Utils.debug("Current mode from ACP: " .. tostring(self.current_mode_id))
+
+    -- Set default mode if configured and available (like Zed does after session/new)
+    local default_mode = Config.behaviour.acp_default_mode
+    Utils.debug("acp_default_mode config: " .. tostring(default_mode))
+    if default_mode and self.chat_history.acp_session_id then
+      local has_mode = vim.tbl_contains(self.available_modes, default_mode)
+      if has_mode then
+        -- Only set if not already in the desired mode
+        if self.current_mode_id ~= default_mode then
+          Utils.debug("Setting default ACP mode: " .. default_mode .. " for session: " .. self.chat_history.acp_session_id)
+          self.acp_client:set_mode(self.chat_history.acp_session_id, default_mode, function(result, err)
+            vim.schedule(function()
+              if err then
+                Utils.warn("Failed to set default mode: " .. vim.inspect(err))
+              else
+                Utils.debug("set_mode succeeded, result: " .. vim.inspect(result))
+                -- Update local state immediately (server will also send current_mode_update)
+                self.current_mode_id = default_mode
+                self:render_result()
+                self:show_input_hint()
+              end
+            end)
+          end)
+        end
+      else
+        local available = table.concat(self.available_modes, ", ")
+        Utils.warn("Default mode '" .. default_mode .. "' not available. Available: " .. available)
+      end
+    end
+  else
+    -- No modes available from agent - this is OK, some agents don't support modes
+    self.available_modes = {}
+    self.current_mode_id = nil
+    Utils.debug("Agent does not provide session modes")
+  end
+end
+
+---Cycle to next session mode
+function Sidebar:cycle_mode()
+  if not self.acp_client or not self.acp_client:has_modes() then
+    Utils.info("Mode cycling not supported by this agent")
+    return
+  end
+  
+  local all_modes = self.acp_client:all_modes()
+  if #all_modes == 0 then
+    Utils.info("Mode cycling not supported by this agent")
+    return
+  end
+  
+  -- Find current index
+  local current_mode_id = self.acp_client:current_mode()
+  local current_idx = 1
+  for i, mode in ipairs(all_modes) do
+    if mode.id == current_mode_id then
+      current_idx = i
+      break
+    end
+  end
+  
+  -- Cycle to next (wrap around)
+  local next_idx = (current_idx % #all_modes) + 1
+  local next_mode = all_modes[next_idx]
+  local next_mode_id = next_mode.id
+  
+  -- Update immediately for responsive UI
+  self.current_mode_id = next_mode_id
+  -- Also update the ACP client's internal state for consistent current_mode() calls
+  if self.acp_client.session_modes then
+    self.acp_client.session_modes.current_mode_id = next_mode_id
+  end
+  self:render_result()
+  self:show_input_hint()
+  
+  -- Notify server (some agents don't support mode switching - that's OK)
+  local session_id = self.chat_history and self.chat_history.acp_session_id
+  if session_id then
+    self.acp_client:set_mode(session_id, next_mode_id, function(result, err)
+      if err then
+        -- Check if this is a "method not found" error - agent doesn't support mode switching
+        if err.message and err.message:match("Method not found") then
+          Utils.debug("Agent does not support mode switching: " .. tostring(err.message))
+          -- Keep the local mode change for UI purposes
+          Utils.info("Mode: " .. next_mode.name .. " (local only)")
+        else
+          Utils.warn("Failed to set mode: " .. tostring(err.message))
+          -- Revert on other errors
+          self.current_mode_id = current_mode_id
+          if self.acp_client.session_modes then
+            self.acp_client.session_modes.current_mode_id = current_mode_id
+          end
+          vim.schedule(function() 
+            self:render_result()
+            self:show_input_hint()
+          end)
+        end
+      else
+        Utils.info("Mode: " .. next_mode.name)
+      end
+    end)
+  else
+    Utils.info("Mode: " .. next_mode.name)
   end
 end
 
@@ -1065,15 +1197,16 @@ function Sidebar:render_result()
 
   local header_text = Utils.icon("󰭻 ") .. title
 
-  -- Add plan mode indicator (check both old plan_only_mode and new ACP plan mode)
-  if Config.plan_only_mode then
-    header_text = header_text .. " " .. Utils.icon(" ") .. "[PLAN]"
-  else
-    -- Check if agent is in ACP plan mode
-    local Llm = require("avante.llm")
-    if Llm.is_in_plan_mode() then
-      header_text = header_text .. " " .. Utils.icon("🗺️ ") .. "[PLAN]"
+  -- Add mode indicator
+  if self.current_mode_id then
+    local mode_name = self.current_mode_id:upper()
+    if self.acp_client then
+      local mode = self.acp_client:mode_by_id(self.current_mode_id)
+      if mode then
+        mode_name = mode.name
+      end
     end
+    header_text = header_text .. " " .. Utils.icon("") .. "[" .. mode_name .. "]"
   end
 
   self:render_header(
@@ -1351,6 +1484,12 @@ function Sidebar:bind_sidebar_keys(codeblocks)
     function() jump_to_prompt("prev") end,
     { buffer = self.containers.result.bufnr, noremap = true, silent = true }
   )
+  vim.keymap.set(
+    "n",
+    Config.mappings.sidebar.cycle_mode,
+    function() self:cycle_mode() end,
+    { buffer = self.containers.result.bufnr, noremap = true, silent = true, desc = "avante: cycle session mode" }
+  )
 end
 
 function Sidebar:unbind_sidebar_keys()
@@ -1610,7 +1749,10 @@ function Sidebar:switch_window_focus(direction)
       error("Invalid 'direction' parameter: " .. direction)
     end
 
-    vim.api.nvim_set_current_win(ordered_winids[next_index])
+    local target_winid = ordered_winids[next_index]
+    if target_winid and vim.api.nvim_win_is_valid(target_winid) then
+      vim.api.nvim_set_current_win(target_winid)
+    end
   end
 end
 
@@ -1624,12 +1766,14 @@ function Sidebar:setup_window_navigation(container)
     function() self:switch_window_focus("next") end,
     { buffer = buf, noremap = true, silent = true, nowait = true }
   )
-  Utils.safe_keymap_set(
-    { "n", "i" },
-    Config.mappings.sidebar.reverse_switch_windows,
-    function() self:switch_window_focus("previous") end,
-    { buffer = buf, noremap = true, silent = true, nowait = true }
-  )
+  if Config.mappings.sidebar.reverse_switch_windows then
+    Utils.safe_keymap_set(
+      { "n", "i" },
+      Config.mappings.sidebar.reverse_switch_windows,
+      function() self:switch_window_focus("previous") end,
+      { buffer = buf, noremap = true, silent = true, nowait = true }
+    )
+  end
 end
 
 function Sidebar:resize()
@@ -1777,24 +1921,26 @@ function Sidebar:toggle_input_fullscreen()
   local input_winid = self.containers.input.winid
   
   if self.is_input_fullscreen then
-    -- Exit fullscreen mode: restore normal height
+    -- Exit fullscreen mode: restore saved height
     self.is_input_fullscreen = false
     
-    -- Restore to normal height based on layout
-    if self:get_layout() == "vertical" then
-      api.nvim_win_set_height(input_winid, Config.windows.input.height)
+    -- Restore the saved height
+    local saved_height = self._input_height_before_fullscreen
+    if saved_height and saved_height > 0 then
+      api.nvim_win_set_height(input_winid, saved_height)
     else
-      -- In horizontal layout, calculate normal height
-      if Utils.is_valid_container(self.containers.result, true) then
-        local result_height = api.nvim_win_get_height(self.containers.result.winid)
-        local selected_code_height = self:get_selected_code_container_height()
-        local normal_height = math.max(1, result_height - selected_code_height)
-        api.nvim_win_set_height(input_winid, normal_height)
-      end
+      -- Fallback to config height if saved height is invalid
+      api.nvim_win_set_height(input_winid, Config.windows.input.height)
     end
+    self._input_height_before_fullscreen = nil
     
+    -- Adjust layout to restore other containers
+    self:adjust_layout()
     Utils.info("Input: normal size")
   else
+    -- Save current height before going fullscreen
+    self._input_height_before_fullscreen = api.nvim_win_get_height(input_winid)
+    
     -- Enter fullscreen mode: maximize input height
     self.is_input_fullscreen = true
     
@@ -1812,6 +1958,7 @@ function Sidebar:toggle_input_fullscreen()
       end
     end
     
+    -- Don't call adjust_layout() when entering fullscreen - it would override our height
     Utils.info("Input: fullscreen mode (<C-f> to exit)")
   end
 end
@@ -2431,11 +2578,24 @@ end
 
 ---@param todos avante.TODO[]
 function Sidebar:update_todos(todos)
-  if self.chat_history == nil then self:reload_chat_history() end
-  if self.chat_history == nil then return end
+  Utils.debug("Sidebar:update_todos called with " .. #todos .. " todos")
+  for i, todo in ipairs(todos) do
+    Utils.debug("  Todo " .. i .. ": status=" .. tostring(todo.status) .. ", content=" .. tostring(todo.content):sub(1, 50))
+  end
+  if self.chat_history == nil then
+    Utils.debug("update_todos: reloading chat_history")
+    self:reload_chat_history()
+  end
+  if self.chat_history == nil then
+    Utils.debug("WARNING: chat_history is nil after reload, cannot save todos")
+    return
+  end
   self.chat_history.todos = todos
+  Utils.debug("Saving todos to chat_history, bufnr=" .. tostring(self.code.bufnr) .. ", filename=" .. tostring(self.chat_history.filename))
   Path.history.save(self.code.bufnr, self.chat_history)
+  Utils.debug("Saved. Creating todos container")
   self:create_todos_container()
+  Utils.debug("update_todos complete")
 end
 
 ---@param messages avante.HistoryMessage | avante.HistoryMessage[]
@@ -2614,19 +2774,25 @@ function Sidebar:show_input_hint()
 
   local config = Config.behaviour.status_line
   if not config or not config.enabled then return end
+  
+  -- Safety check: ensure containers are initialized
+  if not self.containers or not self.containers.input then return end
+  if not self.containers.input.winid or not vim.api.nvim_win_is_valid(self.containers.input.winid) then return end
+  if not self.containers.input.bufnr or not vim.api.nvim_buf_is_valid(self.containers.input.bufnr) then return end
 
   -- Build status line parts
   local parts = {}
   local plan_mode_text = nil
 
-  -- 1. Plan mode indicator
+  -- 1. Mode indicator
   if config.show_plan_mode then
-    -- Check both Config.plan_only_mode (manual toggle) and ACP native plan mode
-    local Llm = require("avante.llm")
-    local is_plan_mode = Config.plan_only_mode or Llm.is_in_plan_mode()
-    
-    if is_plan_mode then
-      plan_mode_text = "🗺️  PLAN"
+    if self.current_mode_id and self.acp_client then
+      local mode = self.acp_client:mode_by_id(self.current_mode_id)
+      local mode_name = mode and mode.name or self.current_mode_id:upper()
+      plan_mode_text = " " .. mode_name
+      table.insert(parts, plan_mode_text)
+    elseif self.current_mode_id then
+      plan_mode_text = " " .. self.current_mode_id:upper()
       table.insert(parts, plan_mode_text)
     else
       plan_mode_text = "⚡ EXEC"
@@ -2662,9 +2828,18 @@ function Sidebar:show_input_hint()
     table.insert(parts, key_display .. ": submit")
   end
 
-  -- 5. Session info (optional)
-  if config.show_session_info and self.current_acp_session_id then
-    table.insert(parts, "S:" .. self.current_acp_session_id:sub(1, 8))
+  -- 5. Session info (mode ID + session ID)
+  if config.show_session_info then
+    local session_parts = {}
+    if self.current_mode_id then
+      table.insert(session_parts, self.current_mode_id)
+    end
+    if self.chat_history and self.chat_history.acp_session_id then
+      table.insert(session_parts, "S:" .. self.chat_history.acp_session_id:sub(1, 8))
+    end
+    if #session_parts > 0 then
+      table.insert(parts, table.concat(session_parts, " "))
+    end
   end
 
   -- Build final text
@@ -2981,6 +3156,43 @@ function Sidebar:get_generate_prompts_options(request, cb)
   if cb then cb(prompts_opts) end
 end
 
+---Collect metadata for prompt logging
+---@return table
+function Sidebar:collect_prompt_metadata()
+  local metadata = {}
+  
+  -- Project and directory
+  metadata.project_root = Utils.root.get({ buf = self.code.bufnr })
+  metadata.working_directory = vim.fn.getcwd()
+  
+  -- Detect first prompt in this chat
+  local History = require("avante.history")
+  metadata.is_first_prompt = #History.get_history_messages(self.chat_history) == 0
+  
+  -- Current file info
+  if self.code and self.code.bufnr then
+    metadata.current_file = api.nvim_buf_get_name(self.code.bufnr)
+    local ok, ft = pcall(api.nvim_get_option_value, "filetype", { buf = self.code.bufnr })
+    metadata.filetype = ok and ft or "unknown"
+  end
+  
+  -- Provider and model
+  metadata.provider = Config.provider or "unknown"
+  local ok, provider_config = pcall(Config.get_provider_config, Config.provider)
+  if ok and provider_config then
+    metadata.model = provider_config.model or "unknown"
+  else
+    metadata.model = "unknown"
+  end
+  
+  -- Session and files
+  metadata.chat_session_id = self.chat_history and self.chat_history.acp_session_id or nil
+  metadata.selected_files = self.file_selector and self.file_selector:get_selected_filepaths() or {}
+  metadata.current_mode_id = self.current_mode_id
+  
+  return metadata
+end
+
 function Sidebar:submit_input()
   if not vim.g.avante_login then
     Utils.warn("Sending message to fast!, API key is not yet set", { title = "Avante" })
@@ -2997,7 +3209,10 @@ end
 
 ---@param request string
 function Sidebar:handle_submit(request)
-  if Config.prompt_logger.enabled then PromptLogger.log_prompt(request) end
+  if Config.prompt_logger.enabled then
+    local metadata = self:collect_prompt_metadata()
+    PromptLogger.log_prompt_v2(request, metadata)
+  end
 
   if self.is_generating then
     self:add_history_messages({ History.Message:new("user", request) })
@@ -3210,14 +3425,22 @@ function Sidebar:handle_submit(request)
       on_tool_log = on_tool_log,
       on_messages_add = on_messages_add,
       on_state_change = on_state_change,
+      sidebar = self,
       acp_client = self.acp_client,
-      on_save_acp_client = function(client) self.acp_client = client end,
+      on_save_acp_client = function(client)
+        self.acp_client = client
+        -- Note: modes are initialized after session creation, not here
+      end,
       acp_session_id = self.chat_history.acp_session_id,
       on_save_acp_session_id = function(session_id)
         self.chat_history.acp_session_id = session_id
         Path.history.save(self.code.bufnr, self.chat_history)
         -- Clear the load flag after saving
         self._load_existing_session = false
+        -- Initialize modes after session is created (modes come from session/new response)
+        self:initialize_modes()
+        self:render_result()
+        self:show_input_hint()
       end,
       set_tool_use_store = set_tool_use_store,
       get_history_messages = function(opts) return self:get_history_messages_for_api(opts) end,
@@ -3271,6 +3494,9 @@ function Sidebar:create_input_container()
   if self.containers.input then self.containers.input:unmount() end
 
   if not self.code.bufnr or not api.nvim_buf_is_valid(self.code.bufnr) then return end
+
+  -- Guard: result container must exist first
+  if not self.containers.result or not self.containers.result.winid then return end
 
   if self.chat_history == nil then self:reload_chat_history() end
 
@@ -3353,14 +3579,21 @@ function Sidebar:create_input_container()
   local function create_submit_mapping(mode, submit_config)
     local key = type(submit_config) == "table" and submit_config.key or submit_config
     local handler
+    local is_double_tap = type(submit_config) == "table" and submit_config.mode == "double_tap"
     
-    if type(submit_config) == "table" and submit_config.mode == "double_tap" then
+    if is_double_tap then
       handler = Utils.create_double_tap_handler(on_submit, submit_config.timeout, self.containers.input.bufnr)
     else
       handler = on_submit
     end
     
-    self.containers.input:map(mode, key, handler)
+    -- For insert mode double-tap on <CR>, use expr mapping to suppress immediate newline
+    local opts = { noremap = true, silent = true }
+    if mode == "i" and is_double_tap and (key == "<CR>" or key == "<Enter>") then
+      opts.expr = true
+    end
+    -- Pass true as 5th arg to force overwrite any existing mapping
+    self.containers.input:map(mode, key, handler, opts, true)
   end
   
   create_submit_mapping("n", Config.mappings.submit.normal)
@@ -3534,6 +3767,9 @@ function Sidebar:get_result_container_width()
 end
 
 function Sidebar:adjust_result_container_layout()
+  -- Guard: result container must exist
+  if not self.containers.result or not self.containers.result.winid then return end
+
   local width = self:get_result_container_width()
   local height = self:get_result_container_height()
 
@@ -3545,6 +3781,10 @@ end
 
 ---@param opts AskOptions
 function Sidebar:render(opts)
+  -- Guard: prevent re-entrant rendering
+  if self._is_rendering then return end
+  self._is_rendering = true
+
   opts = opts or {}
   self.augroup = api.nvim_create_augroup("avante_sidebar_" .. self.id, { clear = true })
 
@@ -3647,6 +3887,7 @@ function Sidebar:render(opts)
     end,
   })
 
+  self._is_rendering = false
   return self
 end
 
@@ -3838,8 +4079,11 @@ function Sidebar:create_selected_files_container()
 end
 
 function Sidebar:create_todos_container()
+  Utils.debug("create_todos_container called, bufnr=" .. tostring(self.code.bufnr))
   local history = Path.history.load(self.code.bufnr)
+  Utils.debug("Loaded history from disk, todos count=" .. #history.todos)
   if #history.todos == 0 then
+    Utils.debug("No todos, unmounting container")
     if self.containers.todos and Utils.is_valid_container(self.containers.todos) then
       self.containers.todos:unmount()
     end
@@ -3919,6 +4163,9 @@ function Sidebar:create_todos_container()
 end
 
 function Sidebar:adjust_layout()
+  -- Guard: result container must exist before adjusting layout
+  if not self.containers.result or not self.containers.result.winid then return end
+
   self:adjust_result_container_layout()
   self:adjust_todos_container_layout()
   self:adjust_selected_code_container_layout()

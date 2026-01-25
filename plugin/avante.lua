@@ -186,9 +186,83 @@ cmd("History", function() require("avante.api").select_history() end, { desc = "
 cmd("Threads", function() require("avante.api").view_threads() end, { desc = "avante: view all threads with telescope" })
 cmd("PlanModeToggle", function() require("avante.api").toggle_plan_mode() end, { desc = "avante: toggle plan-only mode" })
 cmd("PlanMode", function() require("avante.api").toggle_plan_mode() end, { desc = "avante: toggle plan-only mode (deprecated, use PlanModeToggle)" })
+cmd("Debug", function()
+  local Config = require("avante.config")
+  Config.debug = not Config.debug
+  local status = Config.debug and "enabled" or "disabled"
+  Utils.info("Debug mode " .. status .. (Config.debug and " - logs at /tmp/avante-debug.log and /tmp/avante-acp-session.log" or ""))
+end, { desc = "avante: toggle debug mode" })
 cmd("RequestPlanMode", function() require("avante.api").request_plan_mode() end, { desc = "avante: request agent to enter plan mode" })
 cmd("SessionSave", function() require("avante.api").save_session() end, { desc = "avante: save current session" })
 cmd("SessionRestore", function() require("avante.api").restore_session() end, { desc = "avante: restore saved session" })
 cmd("SessionDelete", function() require("avante.api").delete_session() end, { desc = "avante: delete saved session" })
 cmd("SessionList", function() require("avante.api").list_sessions() end, { desc = "avante: list all saved sessions" })
 cmd("Stop", function() require("avante.api").stop() end, { desc = "avante: stop current AI request" })
+cmd("Mode", function()
+  local sidebar = require("avante").get()
+  if not sidebar then
+    Utils.error("No sidebar found. Open Avante first with :AvanteChat or :AvanteChatNew")
+    return
+  end
+  sidebar:cycle_mode()
+end, { desc = "avante: cycle through session modes" })
+cmd("Prompts", function()
+  require("avante.prompt_selector").open({ mode = "copy" })
+end, { desc = "avante: browse and copy prompts to clipboard" })
+cmd("Modes", function()
+  local sidebar = require("avante").get()
+  if not sidebar then
+    Utils.error("No sidebar found. Open Avante first with :AvanteChat or :AvanteChatNew")
+    return
+  end
+  
+  -- Build mode information
+  local lines = { "Available Session Modes:", "" }
+  
+  if sidebar.acp_client and sidebar.acp_client:has_modes() then
+    -- Show ACP client modes
+    table.insert(lines, "Source: ACP Agent")
+    table.insert(lines, "")
+    for _, mode in ipairs(sidebar.acp_client:all_modes()) do
+      local is_current = mode.id == sidebar.current_mode_id
+      local marker = is_current and "→ " or "  "
+      local name = mode.name or mode.id
+      local desc = mode.description or "No description"
+      table.insert(lines, string.format("%s%s (%s)", marker, name, mode.id))
+      table.insert(lines, string.format("    %s", desc))
+      table.insert(lines, "")
+    end
+  else
+    -- No modes available
+    table.insert(lines, "No modes available from agent")
+    table.insert(lines, "")
+    table.insert(lines, "The connected agent does not provide session modes.")
+  end
+  
+  table.insert(lines, "")
+  table.insert(lines, "Use :AvanteMode or 'M' in the sidebar to cycle modes")
+  
+  -- Display in a floating window
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_buf_set_option(buf, "modifiable", false)
+  vim.api.nvim_buf_set_option(buf, "filetype", "markdown")
+  
+  local width = 80
+  local height = math.min(#lines + 2, vim.o.lines - 4)
+  local win = vim.api.nvim_open_win(buf, true, {
+    relative = "editor",
+    width = width,
+    height = height,
+    col = (vim.o.columns - width) / 2,
+    row = (vim.o.lines - height) / 2,
+    style = "minimal",
+    border = "rounded",
+    title = " Session Modes ",
+    title_pos = "center",
+  })
+  
+  -- Close on q or <Esc>
+  vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = buf, noremap = true, silent = true })
+  vim.keymap.set("n", "<Esc>", "<cmd>close<cr>", { buffer = buf, noremap = true, silent = true })
+end, { desc = "avante: show available session modes" })

@@ -119,6 +119,16 @@ local Utils = require("avante.utils")
 ---@class avante.acp.PlanEntry
 ---@field content string
 ---@field priority ACPPlanEntryPriority
+---@field status "pending"|"in_progress"|"completed"|nil
+
+---@class avante.acp.SessionMode
+---@field id string
+---@field name string
+---@field description string|nil
+
+---@class avante.acp.SessionModeState
+---@field current_mode_id string
+---@field modes avante.acp.SessionMode[]
 ---@field status ACPPlanEntryStatus
 
 ---@class avante.acp.Plan
@@ -130,7 +140,7 @@ local Utils = require("avante.utils")
 ---@field input? table<string, any>
 
 ---@class avante.acp.BaseSessionUpdate
----@field sessionUpdate "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update" | "plan" | "available_commands_update"
+---@field sessionUpdate "user_message_chunk" | "agent_message_chunk" | "agent_thought_chunk" | "tool_call" | "tool_call_update" | "plan" | "available_commands_update" | "current_mode_update"
 
 ---@class avante.acp.UserMessageChunk : avante.acp.BaseSessionUpdate
 ---@field sessionUpdate "user_message_chunk"
@@ -162,6 +172,10 @@ local Utils = require("avante.utils")
 ---@class avante.acp.AvailableCommandsUpdate : avante.acp.BaseSessionUpdate
 ---@field sessionUpdate "available_commands_update"
 ---@field availableCommands avante.acp.AvailableCommand[]
+
+---@class avante.acp.CurrentModeUpdate : avante.acp.BaseSessionUpdate
+---@field sessionUpdate "current_mode_update"
+---@field currentModeId string
 
 ---@class avante.acp.PermissionOption
 ---@field optionId string
@@ -207,7 +221,7 @@ ACPClient.ERROR_CODES = {
 }
 
 ---@class ACPHandlers
----@field on_session_update? fun(update: avante.acp.UserMessageChunk | avante.acp.AgentMessageChunk | avante.acp.AgentThoughtChunk | avante.acp.ToolCallUpdate | avante.acp.PlanUpdate | avante.acp.AvailableCommandsUpdate)
+---@field on_session_update? fun(update: avante.acp.UserMessageChunk | avante.acp.AgentMessageChunk | avante.acp.AgentThoughtChunk | avante.acp.ToolCallUpdate | avante.acp.PlanUpdate | avante.acp.AvailableCommandsUpdate | avante.acp.CurrentModeUpdate)
 ---@field on_request_permission? fun(tool_call: table, options: table[], callback: fun(option_id: string | nil)): nil
 ---@field on_read_file? fun(path: string, line: integer | nil, limit: integer | nil, callback: fun(content: string), error_callback: fun(message: string, code: integer|nil)): nil
 ---@field on_write_file? fun(path: string, content: string, callback: fun(error: string|nil)): nil
@@ -248,6 +262,8 @@ function ACPClient:new(config)
     state = "disconnected",
     reconnect_count = 0,
     heartbeat_timer = nil,
+    session_modes = nil, ---@type avante.acp.SessionModeState|nil
+    on_mode_changed = nil, ---@type fun(mode_id: string)|nil
   }, { __index = self })
 
   client:_setup_transport()
@@ -604,6 +620,22 @@ function ACPClient:_handle_session_update(params)
     return
   end
 
+  -- Debug log the session update type
+  Utils.debug("session/update received: sessionUpdate=" .. tostring(update.sessionUpdate))
+  if update.sessionUpdate == "plan" then
+    Utils.debug("Plan update entries: " .. vim.inspect(update.entries))
+  end
+
+  -- Handle CurrentModeUpdate internally
+  if update.sessionUpdate == "current_mode_update" then
+    if self.session_modes then
+      self.session_modes.current_mode_id = update.currentModeId
+    end
+    if self.on_mode_changed then
+      vim.schedule(function() self.on_mode_changed(update.currentModeId) end)
+    end
+  end
+
   if self.config.handlers and self.config.handlers.on_session_update then
     vim.schedule(function() self.config.handlers.on_session_update(update) end)
   end
@@ -617,7 +649,13 @@ function ACPClient:_handle_request_permission(message_id, params)
   local tool_call = params.toolCall
   local options = params.options
 
-  if not session_id or not tool_call then return end
+  if not session_id or not tool_call then 
+    Utils.debug("Permission request missing sessionId or toolCall")
+    return 
+  end
+
+  Utils.debug("Permission request received: session=" .. session_id .. ", tool=" .. (tool_call.kind or "unknown") .. ", message_id=" .. message_id)
+  Utils.debug("Permission options: " .. vim.inspect(options))
 
   if self.config.handlers and self.config.handlers.on_request_permission then
     vim.schedule(function()
@@ -625,15 +663,19 @@ function ACPClient:_handle_request_permission(message_id, params)
         tool_call,
         options,
         function(option_id)
+          Utils.debug("Permission response: message_id=" .. message_id .. ", option_id=" .. option_id)
           self:_send_result(message_id, {
             outcome = {
               outcome = "selected",
               optionId = option_id,
             },
           })
+          Utils.debug("Permission response sent successfully")
         end
       )
     end)
+  else
+    Utils.warn("No permission handler configured")
   end
 end
 
@@ -741,6 +783,14 @@ function ACPClient:initialize(callback)
     self.agent_capabilities = result.agentCapabilities
     self.auth_methods = result.authMethods or {}
 
+    -- Parse session modes from agent capabilities
+    if result.agentCapabilities and result.agentCapabilities.modes then
+      self.session_modes = {
+        current_mode_id = result.agentCapabilities.defaultMode or result.agentCapabilities.modes[1].id,
+        modes = result.agentCapabilities.modes
+      }
+    end
+
     -- Check if we need to authenticate
     local auth_method = self.config.auth_method
 
@@ -794,6 +844,22 @@ function ACPClient:create_session(cwd, mcp_servers, callback)
       callback(nil, error)
       return
     end
+    
+    -- Parse session modes from response (Zed-style: modes come from session/new response)
+    Utils.debug("session/new response keys: " .. vim.inspect(vim.tbl_keys(result)))
+    if result.modes then
+      Utils.debug("session/new modes: " .. vim.inspect(result.modes))
+    else
+      Utils.debug("session/new: no modes in response")
+    end
+    if result.modes and result.modes.availableModes and #result.modes.availableModes > 0 then
+      self.session_modes = {
+        current_mode_id = result.modes.currentModeId,
+        modes = result.modes.availableModes,
+      }
+      Utils.debug("Session modes from session/new: " .. #self.session_modes.modes .. " modes available, current: " .. tostring(self.session_modes.current_mode_id))
+    end
+
     callback(result.sessionId, nil)
   end)
 end
@@ -817,19 +883,105 @@ function ACPClient:load_session(session_id, cwd, mcp_servers, callback)
     sessionId = session_id,
     cwd = cwd,
     mcpServers = mcp_servers or {},
-  }, callback)
+  }, function(result, err)
+    if result then
+      -- Parse session modes from response (same as session/new)
+      if result.modes and result.modes.availableModes and #result.modes.availableModes > 0 then
+        self.session_modes = {
+          current_mode_id = result.modes.currentModeId,
+          modes = result.modes.availableModes,
+        }
+        Utils.debug("Session modes from session/load: " .. #self.session_modes.modes .. " modes available")
+      end
+    end
+    callback(result, err)
+  end)
 end
 
 ---Send prompt
 ---@param session_id string
 ---@param prompt table[]
+---@param mode_id string|nil Optional mode ID to include with the prompt
 ---@param callback fun(result: table|nil, err: avante.acp.ACPError|nil)
-function ACPClient:send_prompt(session_id, prompt, callback)
+function ACPClient:send_prompt(session_id, prompt, mode_id, callback)
+  -- Handle optional mode_id parameter for backward compatibility
+  if type(mode_id) == "function" then
+    callback = mode_id
+    mode_id = nil
+  end
+  
   local params = {
     sessionId = session_id,
     prompt = prompt,
   }
+
+  -- Include current mode if available and agent supports modes
+  if mode_id and self:has_modes() then
+    params.modeId = mode_id
+    Utils.debug("Sending prompt with modeId: " .. mode_id)
+  end
+  
   return self:_send_request("session/prompt", params, callback)
+end
+
+---Get current mode ID (Zed-style AgentSessionModes interface)
+---@return string|nil
+function ACPClient:current_mode()
+  if self.session_modes then
+    return self.session_modes.current_mode_id
+  end
+  return nil
+end
+
+---Get all available modes (Zed-style AgentSessionModes interface)
+---@return avante.acp.SessionMode[]
+function ACPClient:all_modes()
+  if self.session_modes and self.session_modes.modes then
+    return self.session_modes.modes
+  end
+  return {}
+end
+
+---Get mode by ID
+---@param mode_id string
+---@return avante.acp.SessionMode|nil
+function ACPClient:mode_by_id(mode_id)
+  if not self.session_modes or not self.session_modes.modes then
+    return nil
+  end
+  for _, mode in ipairs(self.session_modes.modes) do
+    if mode.id == mode_id then
+      return mode
+    end
+  end
+  return nil
+end
+
+---Check if modes are available from agent
+---@return boolean
+function ACPClient:has_modes()
+  return self.session_modes ~= nil and self.session_modes.modes ~= nil and #self.session_modes.modes > 0
+end
+
+---Set session mode (Zed-style AgentSessionModes interface)
+---@param session_id string
+---@param mode_id string
+---@param callback fun(result: table|nil, err: avante.acp.ACPError|nil)
+function ACPClient:set_mode(session_id, mode_id, callback)
+  callback = callback or function() end
+
+  self:_send_request("session/set_mode", {
+    sessionId = session_id,
+    modeId = mode_id,
+  }, callback)
+end
+
+---@deprecated Use set_mode instead
+---@param session_id string
+---@param mode_id string
+---@param callback fun(result: table|nil, err: avante.acp.ACPError|nil)
+function ACPClient:set_session_mode(session_id, mode_id, callback)
+  self:set_mode(session_id, mode_id, callback)
 end
 
 ---Cancel session
