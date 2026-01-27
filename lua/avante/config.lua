@@ -581,6 +581,16 @@ M._defaults = {
       format = nil, -- Custom format string: "{plan_mode} | {following_status} | {tokens} | {submit_key}"
     },
   },
+  notifications = { -- Desktop notifications for agent completion
+    enabled = true, -- Master toggle for all notifications
+    notify_on_complete = true, -- Notify when agent completes successfully
+    notify_on_error = true, -- Notify when agent encounters an error
+    notify_on_cancel = false, -- Notify when agent is cancelled (opt-in)
+    include_duration = true, -- Show task duration in notification
+    include_summary = true, -- Show brief task description
+    max_summary_length = 50, -- Character limit for task summary
+    sound = true, -- Enable notification sound (platform-dependent)
+  },
   prompt_logger = { -- logs prompts to disk with rich metadata (per-project, searchable via telescope)
     enabled = true, -- toggle logging entirely
     storage_path = Utils.join_paths(vim.fn.stdpath("state"), "avante"), -- base path for per-project prompt storage

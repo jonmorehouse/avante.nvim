@@ -62,6 +62,9 @@ function M.check()
 
   -- Check TreeSitter dependencies
   M.check_treesitter()
+  
+  -- Check notification tools
+  M.check_notification_tools()
 end
 
 -- Check TreeSitter functionality and parsers
@@ -99,6 +102,61 @@ function M.check_treesitter()
   else
     H.ok("TreeSitter highlighter is available")
   end
+end
+
+-- Check notification tool availability
+function M.check_notification_tools()
+  H.start("Desktop Notifications")
+  
+  if not Config.notifications.enabled then
+    H.info("Desktop notifications are disabled in config")
+    return
+  end
+  
+  local os_name = vim.uv.os_uname().sysname
+  local tool_name, install_cmd, optional_tool
+  
+  if os_name == "Darwin" then
+    tool_name = "osascript"
+    install_cmd = "Built-in on macOS"
+    optional_tool = "terminal-notifier"
+  elseif os_name == "Linux" then
+    tool_name = "notify-send"
+    install_cmd = "sudo apt install libnotify-bin (Ubuntu/Debian) or sudo pacman -S libnotify (Arch)"
+  elseif os_name == "Windows_NT" then
+    tool_name = "powershell"
+    install_cmd = "Built-in on Windows 10+"
+  else
+    H.warn("Unknown operating system: " .. os_name)
+    return
+  end
+  
+  -- Check primary notification tool
+  if vim.fn.executable(tool_name) == 1 then
+    H.ok(string.format("Notification tool '%s' is available", tool_name))
+  else
+    H.warn(
+      string.format("Notification tool '%s' not found", tool_name),
+      install_cmd
+    )
+  end
+  
+  -- Check for optional enhanced tools on macOS
+  if os_name == "Darwin" and optional_tool then
+    if vim.fn.executable(optional_tool) == 1 then
+      H.ok(string.format("Enhanced notification tool '%s' is available", optional_tool))
+    else
+      H.info(
+        string.format("Optional: Install '%s' for better notifications", optional_tool),
+        "brew install terminal-notifier"
+      )
+    end
+  end
+  
+  -- Show configuration status
+  H.info(string.format("Notify on complete: %s", Config.notifications.notify_on_complete and "enabled" or "disabled"))
+  H.info(string.format("Notify on error: %s", Config.notifications.notify_on_error and "enabled" or "disabled"))
+  H.info(string.format("Notify on cancel: %s", Config.notifications.notify_on_cancel and "enabled" or "disabled"))
 end
 
 return M

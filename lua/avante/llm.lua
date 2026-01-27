@@ -555,6 +555,31 @@ function M.generate_prompts(opts)
   }
 end
 
+---Extract task summary from message history
+---@param messages table[]
+---@return string
+function M._extract_task_summary(messages)
+  if not messages or #messages == 0 then return "Agent task" end
+  
+  -- Find most recent user message
+  for i = #messages, 1, -1 do
+    local msg = messages[i]
+    if msg.role == "user" and msg.content then
+      local content = msg.content
+      -- Remove <task> tags if present
+      content = content:gsub("<task>", ""):gsub("</task>", "")
+      -- Return first N characters
+      local max_len = Config.notifications.max_summary_length
+      if #content > max_len then
+        return content:sub(1, max_len) .. "..."
+      end
+      return content
+    end
+  end
+  
+  return "Agent task"
+end
+
 ---@param opts AvanteGeneratePromptsOptions
 ---@return integer
 function M.calculate_tokens(opts)
@@ -1895,6 +1920,15 @@ function M._continue_stream_acp(opts, acp_client, session_id)
       end
       acp_client:cancel_session(session_id)
       opts.on_stop({ reason = "cancelled" })
+      
+      -- Send cancellation notification
+      if Config.notifications.enabled and Config.notifications.notify_on_cancel then
+        local ok, Notifications = pcall(require, "avante.notifications")
+        if ok then
+          local task_summary = M._extract_task_summary(opts.messages or opts.history_messages or {})
+          Notifications.on_agent_complete(session_id, { reason = "cancelled" }, task_summary)
+        end
+      end
     end,
   })
   
@@ -1905,6 +1939,14 @@ function M._continue_stream_acp(opts, acp_client, session_id)
     current_mode_id = sidebar.current_mode_id
     if current_mode_id then
       Utils.debug("Including mode in prompt: " .. current_mode_id)
+    end
+  end
+  
+  -- Track agent start for notifications
+  if Config.notifications.enabled then
+    local ok, Notifications = pcall(require, "avante.notifications")
+    if ok then
+      Notifications.on_agent_start(session_id)
     end
   end
   
@@ -2035,9 +2077,28 @@ function M._continue_stream_acp(opts, acp_client, session_id)
         return
       end
       opts.on_stop({ reason = "error", error = err_ })
+      
+      -- Send error notification
+      if Config.notifications.enabled and Config.notifications.notify_on_error then
+        local ok, Notifications = pcall(require, "avante.notifications")
+        if ok then
+          local task_summary = M._extract_task_summary(opts.messages or opts.history_messages or {})
+          Notifications.on_agent_complete(session_id, { reason = "error", error = err_ }, task_summary)
+        end
+      end
+      
       return
     end
     opts.on_stop({ reason = "complete" })
+    
+    -- Send completion notification
+    if Config.notifications.enabled and Config.notifications.notify_on_complete then
+      local ok, Notifications = pcall(require, "avante.notifications")
+      if ok then
+        local task_summary = M._extract_task_summary(opts.messages or opts.history_messages or {})
+        Notifications.on_agent_complete(session_id, { reason = "complete" }, task_summary)
+      end
+    end
   end)
 end
 

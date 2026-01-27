@@ -337,6 +337,28 @@ function Sidebar:is_open() return Utils.is_valid_container(self.containers.resul
 
 function Sidebar:in_code_win() return self.code.winid == api.nvim_get_current_win() end
 
+---Extract task summary from chat history
+---@return string
+function Sidebar:_extract_task_summary()
+  local messages = self.chat_history.messages or {}
+  
+  -- Find most recent user message
+  for i = #messages, 1, -1 do
+    local msg = messages[i]
+    if msg.role == "user" and msg.content then
+      local content = msg.content
+      local Config = require("avante.config")
+      local max_len = Config.notifications.max_summary_length
+      if #content > max_len then
+        return content:sub(1, max_len) .. "..."
+      end
+      return content
+    end
+  end
+  
+  return "Agent task"
+end
+
 ---@param opts AskOptions
 function Sidebar:toggle(opts)
   local in_visual_mode = Utils.in_visual_mode() and self:in_code_win()
@@ -3314,7 +3336,17 @@ function Sidebar:handle_submit(request)
   vim.keymap.set("n", "G", on_G, { buffer = self.containers.result.bufnr })
 
   ---@type AvanteLLMStartCallback
-  local function on_start(_) end
+  local function on_start(_)
+    -- Track agent start for notifications
+    local Config = require("avante.config")
+    if Config.notifications.enabled then
+      local ok, Notifications = pcall(require, "avante.notifications")
+      if ok then
+        local session_id = self.chat_history.acp_session_id or "internal_" .. self.bufnr
+        Notifications.on_agent_start(session_id)
+      end
+    end
+  end
 
   ---@param messages avante.HistoryMessage[]
   local function on_messages_add(messages) self:add_history_messages(messages) end
@@ -3370,6 +3402,23 @@ function Sidebar:handle_submit(request)
       vim.keymap.del("n", "k", { buffer = self.containers.result.bufnr })
       vim.keymap.del("n", "G", { buffer = self.containers.result.bufnr })
     end)
+
+    -- Send notifications for internal agent completion
+    local Config = require("avante.config")
+    if Config.notifications.enabled then
+      local should_notify = (stop_opts.reason == "complete" and Config.notifications.notify_on_complete)
+        or (stop_opts.error and stop_opts.error ~= vim.NIL and Config.notifications.notify_on_error)
+        or (stop_opts.reason == "cancelled" and Config.notifications.notify_on_cancel)
+      
+      if should_notify then
+        local ok, Notifications = pcall(require, "avante.notifications")
+        if ok then
+          local session_id = self.chat_history.acp_session_id or "internal_" .. self.bufnr
+          local task_summary = self:_extract_task_summary()
+          Notifications.on_agent_complete(session_id, stop_opts, task_summary)
+        end
+      end
+    end
 
     if stop_opts.error ~= nil and stop_opts.error ~= vim.NIL then
       local msg_content = stop_opts.error

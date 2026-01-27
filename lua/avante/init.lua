@@ -547,6 +547,18 @@ function M.setup(opts)
   require("avante.providers").setup()
   require("avante.clipboard").setup()
 
+  -- Initialize notification system
+  if Config.notifications.enabled then
+    local ok, Notifications = pcall(require, "avante.notifications")
+    if ok then
+      Notifications.setup()
+    else
+      if Config.debug then
+        Utils.warn("Failed to initialize notification system", { once = true })
+      end
+    end
+  end
+
   -- setup helpers
   H.autocmds()
   H.keymaps()
