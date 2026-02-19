@@ -433,6 +433,40 @@ local function tool_to_lines(item, message, messages, expanded)
   else
     state = "succeeded"
   end
+
+  -- Collapsed single-line view for completed/failed tool calls
+  if not expanded and state ~= "generating" then
+    -- Custom collapsed view for AskUserQuestion
+    if item.name == "AskUserQuestion" then
+      local q = (item.input and (item.input.question or item.input.text)) or "Question"
+      if #q > 40 then q = q:sub(1, 37) .. "..." end
+      local answer = "..."
+      if result and result.content then
+        answer = type(result.content) == "string" and result.content
+          or (type(result.content) == "table" and result.content.text) or "..."
+        if #answer > 30 then answer = answer:sub(1, 27) .. "..." end
+      end
+      return {
+        Line:new({
+          { "▶ " },
+          { "❓ " },
+          { 'Q: "' .. q .. '"', STATE_TO_HL[state] },
+          { " → " .. answer, Highlights.AVANTE_COMMENT_FG },
+        }),
+      }
+    end
+
+    local icon = state == "succeeded" and "✓" or "✗"
+    return {
+      Line:new({
+        { "▶ " },
+        { icon .. " " },
+        { tool_name .. " ", STATE_TO_HL[state] },
+        { " " .. state, Highlights.AVANTE_COMMENT_FG },
+      }),
+    }
+  end
+
   table.insert(
     lines,
     Line:new({

@@ -526,6 +526,9 @@ vim.g.avante_login = vim.g.avante_login
 ---@field acp_session_id string | nil
 ---@field working_directory string | nil
 ---@field selected_files string[] | nil
+---@field tags string[] | nil
+---@field parent_thread_id string | nil
+---@field starred boolean | nil
 ---
 ---@class avante.ChatMemory
 ---@field content string

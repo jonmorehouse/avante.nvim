@@ -44,7 +44,7 @@ local SIDEBAR_CONTAINERS = {
   "result",
   "selected_code",
   "selected_files",
-  "todos",
+  "plan",
   "input",
 }
 
@@ -63,7 +63,7 @@ Sidebar.__index = Sidebar
 ---@field id integer
 ---@field augroup integer
 ---@field code avante.CodeState
----@field containers { result?: NuiSplit, todos?: NuiSplit, selected_code?: NuiSplit, selected_files?: NuiSplit, input?: NuiSplit }
+---@field containers { result?: NuiSplit, plan?: NuiSplit, selected_code?: NuiSplit, selected_files?: NuiSplit, input?: NuiSplit }
 ---@field file_selector FileSelector
 ---@field chat_history avante.ChatHistory | nil
 ---@field current_state avante.GenerateState | nil
@@ -80,6 +80,7 @@ Sidebar.__index = Sidebar
 ---@field post_render? fun(sidebar: avante.Sidebar)
 ---@field permission_handler fun(id: string) | nil
 ---@field permission_button_options ({ id: string, icon: string|nil, name: string }[]) | nil
+---@field permission_question_text string | nil
 ---@field expanded_message_uuids table<string, boolean>
 ---@field tool_message_positions table<string, [integer, integer]>
 ---@field skip_line_count integer | nil
@@ -88,6 +89,10 @@ Sidebar.__index = Sidebar
 ---@field is_in_full_view boolean
 ---@field current_mode_id string | nil
 ---@field available_modes string[]
+---@field acp_thread avante.AcpThread | nil
+---@field _context_panel_visible boolean
+---@field _plan_bufnr integer | nil  -- deprecated: plan now uses containers.plan
+---@field _plan_path string | nil
 
 ---@param id integer the tabpage id retrieved from api.nvim_get_current_tabpage()
 function Sidebar:new(id)
@@ -128,6 +133,12 @@ function Sidebar:new(id)
     is_input_fullscreen = false,
     current_mode_id = nil,
     available_modes = {},
+    acp_thread = nil,
+    _context_panel_visible = false,
+    _plan_bufnr = nil,
+    _plan_path = nil,
+    follow_mode = Config.behaviour.acp_follow_agent_locations,
+    _current_session_ctx = nil,
   }, Sidebar)
 end
 
@@ -379,10 +390,13 @@ function Sidebar:initialize_modes()
     self.available_modes = vim.tbl_map(function(m) return m.id end, self.acp_client:all_modes())
     self.current_mode_id = self.acp_client:current_mode()
 
-    -- Setup mode change callback
+    -- Setup mode change callback — routes through acp_thread if available
     self.acp_client.on_mode_changed = function(mode_id)
       vim.schedule(function()
         self.current_mode_id = mode_id
+        if self.acp_thread then
+          self.acp_thread.current_mode_id = mode_id
+        end
         self:render_result()
         self:show_input_hint()
         local mode = self.acp_client:mode_by_id(mode_id)
@@ -393,6 +407,11 @@ function Sidebar:initialize_modes()
 
     Utils.debug("Initialized " .. #self.available_modes .. " modes from agent: " .. table.concat(self.available_modes, ", "))
     Utils.debug("Current mode from ACP: " .. tostring(self.current_mode_id))
+
+    -- Sync to acp_thread if available
+    if self.acp_thread then
+      self.acp_thread:initialize_modes(self.acp_client:all_modes(), self.current_mode_id)
+    end
 
     -- Set default mode if configured and available (like Zed does after session/new)
     local default_mode = Config.behaviour.acp_default_mode
@@ -411,6 +430,9 @@ function Sidebar:initialize_modes()
                 Utils.debug("set_mode succeeded, result: " .. vim.inspect(result))
                 -- Update local state immediately (server will also send current_mode_update)
                 self.current_mode_id = default_mode
+                if self.acp_thread then
+                  self.acp_thread.current_mode_id = default_mode
+                end
                 self:render_result()
                 self:show_input_hint()
               end
@@ -426,8 +448,188 @@ function Sidebar:initialize_modes()
     -- No modes available from agent - this is OK, some agents don't support modes
     self.available_modes = {}
     self.current_mode_id = nil
+    if self.acp_thread then
+      self.acp_thread.available_modes = {}
+      self.acp_thread.current_mode_id = nil
+    end
     Utils.debug("Agent does not provide session modes")
   end
+end
+
+--- Create or update the AcpThread for this sidebar.
+--- This bridges the new abstraction with the existing sidebar state.
+--- Call after a session is created/loaded and acp_client is available.
+function Sidebar:ensure_acp_thread()
+  local AcpThread = require("avante.acp_thread")
+
+  if not self.acp_thread then
+    self.acp_thread = AcpThread:new({
+      session_id = self.chat_history and self.chat_history.acp_session_id or nil,
+      title = self.chat_history and self.chat_history.title or nil,
+      tags = self.chat_history and self.chat_history.tags or {},
+    })
+  end
+
+  -- Sync session_id
+  if self.chat_history and self.chat_history.acp_session_id then
+    self.acp_thread.session_id = self.chat_history.acp_session_id
+  end
+
+  -- Sync mode state
+  self.acp_thread.current_mode_id = self.current_mode_id
+  self.acp_thread.available_modes = {}
+  if self.acp_client and self.acp_client:has_modes() then
+    self.acp_thread.available_modes = self.acp_client:all_modes()
+  end
+
+  -- Wire up callbacks that update the sidebar
+  self.acp_thread:set_callbacks({
+    on_state_change = function(new_state, _old_state)
+      vim.schedule(function()
+        self:show_input_hint()
+      end)
+    end,
+    on_mode_change = function(mode_id, mode_name)
+      vim.schedule(function()
+        self.current_mode_id = mode_id
+        self:render_result()
+        self:show_input_hint()
+      end)
+    end,
+    on_plan_update = function(todos)
+      vim.schedule(function()
+        self:update_plan(todos)
+        self:show_input_hint() -- refresh plan progress in status line
+      end)
+    end,
+  })
+
+  return self.acp_thread
+end
+
+--- Create a new thread, resetting the sidebar for a fresh conversation.
+--- Auto-tags the thread with provider and project info.
+function Sidebar:new_thread()
+  -- Reset sidebar state
+  self.acp_thread = nil
+  self.current_mode_id = nil
+  self.available_modes = {}
+
+  -- Create fresh history
+  local Path = require("avante.path")
+  self.chat_history = Path.history.new(self.code.bufnr)
+
+  -- Auto-tag with provider info
+  local provider = Config.provider or "unknown"
+  self.chat_history.tags = { provider }
+  local cwd = vim.fn.fnamemodify(vim.fn.getcwd(), ":t")
+  if cwd and cwd ~= "" then
+    table.insert(self.chat_history.tags, cwd)
+  end
+
+  Path.history.save(self.code.bufnr, self.chat_history)
+
+  -- Clear UI
+  self:clear_state()
+  self:render_result()
+  self:show_input_hint()
+
+  Utils.debug("Created new thread: " .. self.chat_history.filename)
+end
+
+--- Load an existing thread by session_id or filename.
+---@param opts { session_id?: string, filename?: string }
+function Sidebar:load_thread(opts)
+  local Path = require("avante.path")
+
+  if opts.filename then
+    self.chat_history = Path.history.load(self.code.bufnr, opts.filename)
+  elseif opts.session_id then
+    -- Find the history file with this session_id
+    local all = Path.history.list(self.code.bufnr)
+    local found = nil
+    for _, h in ipairs(all) do
+      if h.acp_session_id == opts.session_id then
+        found = h
+        break
+      end
+    end
+    if found then
+      self.chat_history = found
+    else
+      Utils.warn("No thread found with session_id: " .. opts.session_id)
+      return
+    end
+  end
+
+  -- Reset thread state — will be re-created on next ensure_acp_thread
+  self.acp_thread = nil
+  self.current_mode_id = nil
+  self.available_modes = {}
+
+  -- Set flag to load session on next submit
+  if self.chat_history.acp_session_id then
+    self._load_existing_session = true
+  end
+
+  -- Update UI
+  self:render_result()
+  self:show_input_hint()
+
+  Utils.debug("Loaded thread: " .. (self.chat_history.filename or "unknown"))
+end
+
+--- Fork the current thread, creating a new conversation branching from the current messages.
+function Sidebar:fork_thread()
+  if not self.chat_history then
+    Utils.warn("No active thread to fork")
+    return
+  end
+
+  local Path = require("avante.path")
+  local AcpThread = require("avante.acp_thread")
+
+  -- Create a new history with a copy of current messages
+  local forked = Path.history.new(self.code.bufnr)
+  forked.title = (self.chat_history.title or "untitled") .. " (fork)"
+  forked.tags = vim.deepcopy(self.chat_history.tags or {})
+  table.insert(forked.tags, "fork")
+  forked.parent_thread_id = self.chat_history.acp_session_id or self.chat_history.filename
+  forked.messages = vim.deepcopy(self.chat_history.messages)
+  forked.entries = vim.deepcopy(self.chat_history.entries)
+  forked.working_directory = self.chat_history.working_directory
+
+  -- Save the forked history
+  Path.history.save(self.code.bufnr, forked)
+
+  -- Switch to the forked thread
+  self.chat_history = forked
+  self.acp_thread = nil
+  self.current_mode_id = nil
+  self.available_modes = {}
+
+  -- Update UI
+  self:render_result()
+  self:show_input_hint()
+
+  Utils.info("Forked thread: " .. forked.filename)
+end
+
+--- Rename the current thread.
+---@param new_title string
+function Sidebar:rename_thread(new_title)
+  if not self.chat_history then
+    Utils.warn("No active thread to rename")
+    return
+  end
+  self.chat_history.title = new_title
+  if self.acp_thread then
+    self.acp_thread.title = new_title
+  end
+  local Path = require("avante.path")
+  Path.history.save(self.code.bufnr, self.chat_history)
+  self:show_input_hint()
+  Utils.info("Thread renamed to: " .. new_title)
 end
 
 ---Cycle to next session mode
@@ -464,9 +666,13 @@ function Sidebar:cycle_mode()
   if self.acp_client.session_modes then
     self.acp_client.session_modes.current_mode_id = next_mode_id
   end
+  -- Sync to acp_thread
+  if self.acp_thread then
+    self.acp_thread.current_mode_id = next_mode_id
+  end
   self:render_result()
   self:show_input_hint()
-  
+
   -- Notify server (some agents don't support mode switching - that's OK)
   local session_id = self.chat_history and self.chat_history.acp_session_id
   if session_id then
@@ -484,7 +690,10 @@ function Sidebar:cycle_mode()
           if self.acp_client.session_modes then
             self.acp_client.session_modes.current_mode_id = current_mode_id
           end
-          vim.schedule(function() 
+          if self.acp_thread then
+            self.acp_thread.current_mode_id = current_mode_id
+          end
+          vim.schedule(function()
             self:render_result()
             self:show_input_hint()
           end)
@@ -1905,8 +2114,8 @@ function Sidebar:toggle_fullscreen_edit()
           self:create_selected_code_container()
         elseif container_name == "selected_files" then
           self:create_selected_files_container()
-        elseif container_name == "todos" then
-          self:create_todos_container()
+        elseif container_name == "plan" then
+          self:create_plan_container()
         end
       end
       self.fullscreen_hidden_containers = nil
@@ -2204,6 +2413,13 @@ end
 ---@return avante.ui.Line[]
 function Sidebar:_get_message_lines(ctx, message, messages, ignore_record_prefix)
   local expanded = self.expanded_message_uuids[message.uuid]
+  -- Default: tool calls that are still generating are expanded; completed ones are collapsed
+  if expanded == nil and message.message and message.message.role == "assistant" then
+    local content = message.message.content
+    if type(content) == "table" and content.type == "tool_use" then
+      expanded = (message.is_calling == true)
+    end
+  end
   if message.visible == false then return {} end
   local lines = Render.message_to_lines(message, messages, expanded)
   if message.is_user_submission and not ignore_record_prefix then
@@ -2259,9 +2475,22 @@ function Sidebar:get_message_lines(ctx, message, messages, ignore_record_prefix)
   if message.state == "generating" or message.is_calling then
     local lines = self:_get_message_lines(ctx, message, messages, ignore_record_prefix)
     if self.permission_handler and self.permission_button_options then
+      -- Show question text if this is an AskUserQuestion permission request
+      if self.permission_question_text then
+        table.insert(lines, Line:new({ { "" } }))
+        table.insert(
+          lines,
+          Line:new({ { Utils.icon("❓ ") .. "Question", Highlights.AVANTE_THINKING } })
+        )
+        table.insert(lines, Line:new({ { "" } }))
+        for _, q_line in ipairs(vim.split(self.permission_question_text, "\n")) do
+          table.insert(lines, Line:new({ { "  " .. q_line } }))
+        end
+      end
+      local group_label = self.permission_question_text and "Answer: " or "Waiting for Confirmation... "
       local button_group_line = ButtonGroupLine:new(self.permission_button_options, {
         on_click = self.permission_handler,
-        group_label = "Waiting for Confirmation... ",
+        group_label = group_label,
       })
       table.insert(lines, Line:new({ { "" } }))
       table.insert(lines, button_group_line)
@@ -2567,13 +2796,15 @@ function Sidebar:new_chat(args, cb)
   self.expanded_message_uuids = {}
   self.tool_message_positions = {}
   self.current_tool_use_extmark_id = nil
+  self._current_session_ctx = nil
+  require("avante.changed_files").clear()
   self:update_content("New chat", { focus = false, scroll = false, callback = function() self:focus_input() end })
   --- goto first line then go to last line
   vim.schedule(function()
     vim.api.nvim_win_call(self.containers.result.winid, function() vim.cmd("normal! ggG") end)
   end)
   if cb then cb(args) end
-  vim.schedule(function() self:create_todos_container() end)
+  vim.schedule(function() self:create_plan_container() end)
 end
 
 local debounced_save_history = Utils.debounce(
@@ -2599,25 +2830,19 @@ function Sidebar:delete_history_messages(uuids)
 end
 
 ---@param todos avante.TODO[]
-function Sidebar:update_todos(todos)
-  Utils.debug("Sidebar:update_todos called with " .. #todos .. " todos")
-  for i, todo in ipairs(todos) do
-    Utils.debug("  Todo " .. i .. ": status=" .. tostring(todo.status) .. ", content=" .. tostring(todo.content):sub(1, 50))
-  end
+function Sidebar:update_plan(todos)
+  Utils.debug("Sidebar:update_plan called with " .. #todos .. " entries")
   if self.chat_history == nil then
-    Utils.debug("update_todos: reloading chat_history")
+    Utils.debug("update_plan: reloading chat_history")
     self:reload_chat_history()
   end
   if self.chat_history == nil then
-    Utils.debug("WARNING: chat_history is nil after reload, cannot save todos")
+    Utils.debug("WARNING: chat_history is nil after reload, cannot save plan")
     return
   end
   self.chat_history.todos = todos
-  Utils.debug("Saving todos to chat_history, bufnr=" .. tostring(self.code.bufnr) .. ", filename=" .. tostring(self.chat_history.filename))
   Path.history.save(self.code.bufnr, self.chat_history)
-  Utils.debug("Saved. Creating todos container")
-  self:create_todos_container()
-  Utils.debug("update_todos complete")
+  self:create_plan_container()
 end
 
 ---@param messages avante.HistoryMessage | avante.HistoryMessage[]
@@ -2824,7 +3049,7 @@ function Sidebar:show_input_hint()
 
   -- 2. Following status indicator
   if config.show_following_status then
-    local is_following = Config.behaviour.acp_follow_agent_locations
+    local is_following = self.follow_mode
     if is_following then
       table.insert(parts, "👁️  FOLLOW")
     else
@@ -2864,6 +3089,24 @@ function Sidebar:show_input_hint()
     end
   end
 
+  -- 6. Plan progress
+  if config.show_plan_progress ~= false then
+    local plan_progress = nil
+    if self.acp_thread then
+      plan_progress = self.acp_thread:plan_progress_string()
+    elseif self.chat_history and self.chat_history.todos and #self.chat_history.todos > 0 then
+      local done = 0
+      local total = #self.chat_history.todos
+      for _, todo in ipairs(self.chat_history.todos) do
+        if todo.status == "done" then done = done + 1 end
+      end
+      plan_progress = "Plan: " .. done .. "/" .. total
+    end
+    if plan_progress then
+      table.insert(parts, plan_progress)
+    end
+  end
+
   -- Build final text
   local hint_text
   if config.format then
@@ -2874,6 +3117,7 @@ function Sidebar:show_input_hint()
       :gsub("{tokens}", parts[3] or "")
       :gsub("{submit_key}", parts[4] or "")
       :gsub("{session_info}", parts[5] or "")
+      :gsub("{plan_progress}", parts[6] or "")
   else
     -- Default: join with " | "
     hint_text = table.concat(parts, " | ")
@@ -3453,6 +3697,16 @@ function Sidebar:handle_submit(request)
   end
 
   if request and request ~= "" then
+    -- Auto-title from first user message
+    if self.chat_history and (self.chat_history.title == "untitled" or self.chat_history.title == nil) then
+      local title = request:sub(1, 60):gsub("\n", " "):gsub("%s+", " ")
+      if #request > 60 then title = title .. "..." end
+      self.chat_history.title = title
+      if self.acp_thread then
+        self.acp_thread.title = title
+      end
+    end
+
     self:add_history_messages({
       History.Message:new("user", request, {
         is_user_submission = true,
@@ -3465,6 +3719,15 @@ function Sidebar:handle_submit(request)
   self:get_generate_prompts_options(request, function(generate_prompts_options)
     ---@type AvanteLLMStreamOptions
     ---@diagnostic disable-next-line: assign-type-mismatch
+    -- Initialize session_ctx for tracking file snapshots and edits
+    if not self._current_session_ctx then
+      self._current_session_ctx = { file_snapshots = {}, edited_files = {} }
+      local ChangedFiles = require("avante.changed_files")
+      self._current_session_ctx.on_file_edited = function(abs_path, tool_name)
+        ChangedFiles.on_file_edited(abs_path, self._current_session_ctx, tool_name)
+      end
+    end
+
     local stream_options = vim.tbl_deep_extend("force", generate_prompts_options, {
       just_connect_acp_client = request == "",
       _load_existing_session = self._load_existing_session or false,
@@ -3479,15 +3742,29 @@ function Sidebar:handle_submit(request)
       on_save_acp_client = function(client)
         self.acp_client = client
         -- Note: modes are initialized after session creation, not here
+        -- Ensure AcpThread is created/synced
+        self:ensure_acp_thread()
       end,
       acp_session_id = self.chat_history.acp_session_id,
       on_save_acp_session_id = function(session_id)
         self.chat_history.acp_session_id = session_id
+        -- Auto-tag with provider info on first session creation
+        if not self.chat_history.tags or #self.chat_history.tags == 0 then
+          self.chat_history.tags = {}
+          local provider = Config.provider or "unknown"
+          table.insert(self.chat_history.tags, provider)
+          local cwd = vim.fn.fnamemodify(vim.fn.getcwd(), ":t")
+          if cwd and cwd ~= "" then
+            table.insert(self.chat_history.tags, cwd)
+          end
+        end
         Path.history.save(self.code.bufnr, self.chat_history)
         -- Clear the load flag after saving
         self._load_existing_session = false
         -- Initialize modes after session is created (modes come from session/new response)
         self:initialize_modes()
+        -- Sync AcpThread with new session
+        self:ensure_acp_thread()
         self:render_result()
         self:show_input_hint()
       end,
@@ -3497,8 +3774,8 @@ function Sidebar:handle_submit(request)
         local history = Path.history.load(self.code.bufnr)
         return history.todos
       end,
-      update_todos = function(todos) self:update_todos(todos) end,
-      session_ctx = {},
+      update_todos = function(todos) self:update_plan(todos) end,
+      session_ctx = self._current_session_ctx or { file_snapshots = {}, edited_files = {} },
       ---@param usage avante.LLMTokenUsage
       update_tokens_usage = function(usage)
         if not usage then return end
@@ -3786,14 +4063,16 @@ function Sidebar:get_selected_code_container_height()
   return math.min(count, max_height)
 end
 
-function Sidebar:get_todos_container_height()
+function Sidebar:get_plan_container_height()
   local history = Path.history.load(self.code.bufnr)
-  if #history.todos == 0 then return 0 end
-  return 3
+  local todo_count = #history.todos
+  if todo_count == 0 then return 0 end
+  -- header line + entries, capped at 12
+  return math.min(todo_count + 1, 12)
 end
 
 function Sidebar:get_result_container_height()
-  local todos_container_height = self:get_todos_container_height()
+  local plan_container_height = self:get_plan_container_height()
   local selected_code_container_height = self:get_selected_code_container_height()
   local selected_files_container_height = self:get_selected_files_container_height()
 
@@ -3804,7 +4083,7 @@ function Sidebar:get_result_container_height()
     api.nvim_get_option_value("lines", {})
       - selected_files_container_height
       - selected_code_container_height
-      - todos_container_height
+      - plan_container_height
       - Config.windows.input.height
   )
 end
@@ -3848,7 +4127,7 @@ function Sidebar:render(opts)
       if closed_winid then
         local container = self:get_sidebar_window(closed_winid)
         -- Ignore closing selected files and todos windows because they can disappear during normal operation
-        if container and container ~= self.containers.selected_files and container ~= self.containers.todos then
+        if container and container ~= self.containers.selected_files and container ~= self.containers.plan then
           self:close()
         end
       end
@@ -3912,7 +4191,7 @@ function Sidebar:render(opts)
 
   self:create_selected_code_container()
 
-  self:create_todos_container()
+  self:create_plan_container()
 
   self:on_mount(opts)
 
@@ -3959,11 +4238,11 @@ function Sidebar:adjust_selected_code_container_layout()
   api.nvim_win_set_height(self.containers.selected_code.winid, win_height)
 end
 
-function Sidebar:adjust_todos_container_layout()
-  if not Utils.is_valid_container(self.containers.todos, true) then return end
+function Sidebar:adjust_plan_container_layout()
+  if not Utils.is_valid_container(self.containers.plan, true) then return end
 
-  local win_height = self:get_todos_container_height()
-  api.nvim_win_set_height(self.containers.todos.winid, win_height)
+  local win_height = self:get_plan_container_height()
+  api.nvim_win_set_height(self.containers.plan.winid, win_height)
 end
 
 function Sidebar:create_selected_files_container()
@@ -4127,36 +4406,37 @@ function Sidebar:create_selected_files_container()
   render()
 end
 
-function Sidebar:create_todos_container()
-  Utils.debug("create_todos_container called, bufnr=" .. tostring(self.code.bufnr))
+function Sidebar:create_plan_container()
+  Utils.debug("create_plan_container called, bufnr=" .. tostring(self.code.bufnr))
   local history = Path.history.load(self.code.bufnr)
   Utils.debug("Loaded history from disk, todos count=" .. #history.todos)
   if #history.todos == 0 then
-    Utils.debug("No todos, unmounting container")
-    if self.containers.todos and Utils.is_valid_container(self.containers.todos) then
-      self.containers.todos:unmount()
+    Utils.debug("No todos, unmounting plan container")
+    if self.containers.plan and Utils.is_valid_container(self.containers.plan) then
+      self.containers.plan:unmount()
     end
-    self.containers.todos = nil
+    self.containers.plan = nil
     self:adjust_layout()
     return
   end
 
-  -- Calculate safe height to prevent "Not enough room" error
-  local safe_height = math.min(3, math.max(1, vim.o.lines - 5))
+  -- Calculate safe height: entries + 1 header, capped at 12
+  local safe_height = math.min(#history.todos + 1, 12)
+  safe_height = math.min(safe_height, math.max(1, vim.o.lines - 5))
 
-  if not Utils.is_valid_container(self.containers.todos, true) then
-    self.containers.todos = Split({
+  if not Utils.is_valid_container(self.containers.plan, true) then
+    self.containers.plan = Split({
       enter = false,
       relative = {
         type = "win",
-        winid = self:get_split_candidate("todos"),
+        winid = self:get_split_candidate("plan"),
       },
       buf_options = vim.tbl_deep_extend("force", buf_options, {
-        modifiable = false,
+        modifiable = true,
         swapfile = false,
-        buftype = "nofile",
+        buftype = "acwrite",
         bufhidden = "wipe",
-        filetype = "AvanteTodos",
+        filetype = "markdown",
       }),
       win_options = vim.tbl_deep_extend("force", base_win_options, {
         fillchars = Config.windows.fillchars,
@@ -4168,47 +4448,141 @@ function Sidebar:create_todos_container()
     })
 
     local ok, err = pcall(function()
-      self.containers.todos:mount()
-      self:setup_window_navigation(self.containers.todos)
+      self.containers.plan:mount()
+      self:setup_window_navigation(self.containers.plan)
     end)
     if not ok then
-      Utils.debug("Failed to create todos container:", err)
-      self.containers.todos = nil
+      Utils.debug("Failed to create plan container:", err)
+      self.containers.plan = nil
       return
     end
+
+    -- Set up BufWriteCmd for editable plan
+    local plan_bufnr = api.nvim_win_get_buf(self.containers.plan.winid)
+    api.nvim_create_autocmd("BufWriteCmd", {
+      buffer = plan_bufnr,
+      callback = function()
+        local buf_lines = api.nvim_buf_get_lines(plan_bufnr, 0, -1, false)
+        local edited_plan = self:parse_plan_buffer(buf_lines)
+        self:send_plan_feedback(edited_plan)
+        vim.bo[plan_bufnr].modified = false
+      end,
+    })
+
+    -- CR in normal mode toggles checkbox state
+    vim.keymap.set("n", "<CR>", function()
+      local row = api.nvim_win_get_cursor(self.containers.plan.winid)[1]
+      local cur_line = api.nvim_buf_get_lines(plan_bufnr, row - 1, row, false)[1] or ""
+      local new_line
+      if cur_line:match("%- %[x%]") then
+        new_line = cur_line:gsub("%- %[x%]", "- [~]", 1)
+      elseif cur_line:match("%- %[~%]") then
+        new_line = cur_line:gsub("%- %[~%]", "- [ ]", 1)
+      elseif cur_line:match("%- %[ %]") then
+        new_line = cur_line:gsub("%- %[ %]", "- [x]", 1)
+      end
+      if new_line then
+        api.nvim_buf_set_lines(plan_bufnr, row - 1, row, false, { new_line })
+      end
+    end, { buffer = plan_bufnr, noremap = true, silent = true, desc = "Toggle plan checkbox" })
   end
+
+  -- Render plan content as markdown checkboxes
   local done_count = 0
   local total_count = #history.todos
   local focused_idx = 1
-  local todos_content_lines = {}
-  for idx, todo in ipairs(history.todos) do
-    local status_content = "[ ]"
+  local plan_lines = {}
+  for _, todo in ipairs(history.todos) do
+    local checkbox = "- [ ] "
     if todo.status == "done" then
       done_count = done_count + 1
-      status_content = "[x]"
+      checkbox = "- [x] "
+    elseif todo.status == "doing" then
+      checkbox = "- [~] "
+    elseif todo.status == "cancelled" then
+      checkbox = "- [x] ~~"
     end
-    if todo.status == "doing" then status_content = "[-]" end
-    local line = string.format("%s %d. %s", status_content, idx, todo.content)
-    if todo.status == "cancelled" then line = "~~" .. line .. "~~" end
-    if todo.status ~= "todo" then focused_idx = idx + 1 end
-    table.insert(todos_content_lines, line)
+    local line = checkbox .. (todo.content or "")
+    if todo.status == "cancelled" then line = line .. "~~" end
+    if todo.status ~= "todo" then focused_idx = focused_idx + 1 end
+    table.insert(plan_lines, line)
   end
-  if focused_idx > #todos_content_lines then focused_idx = #todos_content_lines end
-  local todos_buf = api.nvim_win_get_buf(self.containers.todos.winid)
-  Utils.unlock_buf(todos_buf)
-  api.nvim_buf_set_lines(todos_buf, 0, -1, false, todos_content_lines)
-  pcall(function() api.nvim_win_set_cursor(self.containers.todos.winid, { focused_idx, 0 }) end)
-  Utils.lock_buf(todos_buf)
+  if focused_idx > #plan_lines then focused_idx = #plan_lines end
+
+  local plan_bufnr = api.nvim_win_get_buf(self.containers.plan.winid)
+  api.nvim_buf_set_lines(plan_bufnr, 0, -1, false, plan_lines)
+  pcall(function() api.nvim_win_set_cursor(self.containers.plan.winid, { focused_idx, 0 }) end)
+
   self:render_header(
-    self.containers.todos.winid,
-    todos_buf,
-    Utils.icon(" ") .. "Todos" .. " (" .. done_count .. "/" .. total_count .. ")",
+    self.containers.plan.winid,
+    plan_bufnr,
+    Utils.icon(" ") .. "Plan" .. " (" .. done_count .. "/" .. total_count .. ")",
     Highlights.SUBTITLE,
     Highlights.REVERSED_SUBTITLE
   )
 
-  local ok, err = pcall(function() self:adjust_layout() end)
-  if not ok then Utils.debug("Failed to adjust layout after todos creation:", err) end
+  local ok2, err2 = pcall(function() self:adjust_layout() end)
+  if not ok2 then Utils.debug("Failed to adjust layout after plan creation:", err2) end
+end
+
+--- Parse markdown checkbox lines back into plan entries
+---@param lines string[]
+---@return avante.TODO[]
+function Sidebar:parse_plan_buffer(lines)
+  local entries = {}
+  for _, line in ipairs(lines) do
+    local status, content
+    if line:match("^%- %[x%] ~~(.-)~~$") then
+      content = line:match("^%- %[x%] ~~(.-)~~$")
+      status = "cancelled"
+    elseif line:match("^%- %[x%] (.+)$") then
+      content = line:match("^%- %[x%] (.+)$")
+      status = "done"
+    elseif line:match("^%- %[~%] (.+)$") then
+      content = line:match("^%- %[~%] (.+)$")
+      status = "doing"
+    elseif line:match("^%- %[ %] (.+)$") then
+      content = line:match("^%- %[ %] (.+)$")
+      status = "todo"
+    end
+    if content then
+      table.insert(entries, { content = content, status = status })
+    end
+  end
+  return entries
+end
+
+--- Send edited plan back to the agent as a user message
+---@param edited_plan avante.TODO[]
+function Sidebar:send_plan_feedback(edited_plan)
+  -- Update internal state
+  if self.chat_history then
+    self.chat_history.todos = edited_plan
+    Path.history.save(self.code.bufnr, self.chat_history)
+  end
+  if self.acp_thread then
+    self.acp_thread.plan_entries = edited_plan
+  end
+
+  -- Build a message describing the updated plan
+  local msg_lines = { "I've updated the plan. Here are my changes:", "" }
+  for i, entry in ipairs(edited_plan) do
+    local checkbox = "[ ] "
+    if entry.status == "done" then
+      checkbox = "[x] "
+    elseif entry.status == "doing" then
+      checkbox = "[~] "
+    elseif entry.status == "cancelled" then
+      checkbox = "[x] ~~"
+    end
+    local suffix = entry.status == "cancelled" and "~~" or ""
+    table.insert(msg_lines, i .. ". " .. checkbox .. (entry.content or "") .. suffix)
+  end
+  table.insert(msg_lines, "")
+  table.insert(msg_lines, "Please follow this updated plan.")
+
+  local message = table.concat(msg_lines, "\n")
+  self:handle_submit(message)
 end
 
 function Sidebar:adjust_layout()
@@ -4216,7 +4590,7 @@ function Sidebar:adjust_layout()
   if not self.containers.result or not self.containers.result.winid then return end
 
   self:adjust_result_container_layout()
-  self:adjust_todos_container_layout()
+  self:adjust_plan_container_layout()
   self:adjust_selected_code_container_layout()
   self:adjust_selected_files_container_layout()
 end

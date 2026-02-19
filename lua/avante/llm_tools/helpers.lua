@@ -41,6 +41,7 @@ function M.confirm_inline(callback, confirm_opts)
     sidebar.scroll = true
     sidebar.permission_button_options = nil
     sidebar.permission_handler = nil
+    sidebar.permission_question_text = nil
     sidebar._history_cache_invalidated = true
     sidebar:update_content("")
   end
@@ -194,9 +195,10 @@ function M.mark_as_not_viewed(path, session_ctx)
 end
 
 ---@param abs_path string
+---@param target_line? integer  -- optional line to jump to in follow mode
 ---@return integer bufnr
 ---@return string | nil error
-function M.get_bufnr(abs_path)
+function M.get_bufnr(abs_path, target_line)
   local sidebar = require("avante").get()
   if not sidebar then return 0, "Avante sidebar not found" end
   local bufnr ---@type integer
@@ -204,8 +206,45 @@ function M.get_bufnr(abs_path)
     ---@diagnostic disable-next-line: param-type-mismatch
     pcall(vim.cmd, "edit " .. abs_path)
     bufnr = vim.api.nvim_get_current_buf()
+    -- Follow mode: jump to target line
+    if sidebar.follow_mode and target_line and target_line > 0 then
+      local line_count = vim.api.nvim_buf_line_count(bufnr)
+      local line = math.min(target_line, line_count)
+      pcall(vim.api.nvim_win_set_cursor, sidebar.code.winid, { line, 0 })
+      pcall(vim.cmd, "normal! zz")
+    end
   end)
   return bufnr, nil
+end
+
+--- Snapshot a file's content before first edit for review purposes
+---@param abs_path string
+---@param session_ctx table
+function M.snapshot_file_for_review(abs_path, session_ctx)
+  if not session_ctx then return end
+  session_ctx.file_snapshots = session_ctx.file_snapshots or {}
+  if session_ctx.file_snapshots[abs_path] then return end -- already snapshotted
+  local ok, content = pcall(function()
+    local lines = vim.fn.readfile(abs_path)
+    return table.concat(lines, "\n")
+  end)
+  if ok and content then
+    session_ctx.file_snapshots[abs_path] = content
+  end
+end
+
+--- Track that a file was edited by the agent
+---@param abs_path string
+---@param session_ctx table
+---@param tool_name? string
+function M.track_edited_file(abs_path, session_ctx, tool_name)
+  if not session_ctx then return end
+  session_ctx.edited_files = session_ctx.edited_files or {}
+  session_ctx.edited_files_order = session_ctx.edited_files_order or {}
+  local is_new = not session_ctx.edited_files[abs_path]
+  session_ctx.edited_files[abs_path] = true
+  if is_new then table.insert(session_ctx.edited_files_order, abs_path) end
+  if session_ctx.on_file_edited then session_ctx.on_file_edited(abs_path, tool_name) end
 end
 
 return M

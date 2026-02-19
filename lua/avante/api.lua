@@ -266,7 +266,7 @@ function M.select_history()
       Path.history.save_latest_filename(buf, filename)
       local sidebar = require("avante").get()
       sidebar:update_content_with_history()
-      sidebar:create_todos_container()
+      sidebar:create_plan_container()
       sidebar:initialize_token_count()
       vim.schedule(function() sidebar:focus_input() end)
     end)
@@ -318,7 +318,7 @@ function M.view_threads()
           sidebar._on_session_load_complete = function()
             sidebar:reload_chat_history()
             sidebar:update_content_with_history()
-            sidebar:create_todos_container()
+            sidebar:create_plan_container()
             sidebar:initialize_token_count()
             vim.schedule(function() sidebar:focus_input() end)
             sidebar._on_session_load_complete = nil
@@ -330,7 +330,7 @@ function M.view_threads()
           end)
         else
           sidebar:update_content_with_history()
-          sidebar:create_todos_container()
+          sidebar:create_plan_container()
           sidebar:initialize_token_count()
           vim.schedule(function() sidebar:focus_input() end)
         end
@@ -379,7 +379,7 @@ function M.view_threads()
             -- Reload history to pick up any changes synced from ACP
             sidebar:reload_chat_history()
             sidebar:update_content_with_history()
-            sidebar:create_todos_container()
+            sidebar:create_plan_container()
             sidebar:initialize_token_count()
             vim.schedule(function() 
               sidebar:focus_input()
@@ -396,14 +396,14 @@ function M.view_threads()
         else
           -- For non-ACP providers, just update the content
           sidebar:update_content_with_history()
-          sidebar:create_todos_container()
+          sidebar:create_plan_container()
           sidebar:initialize_token_count()
           vim.schedule(function() sidebar:focus_input() end)
         end
       else
         -- No ACP session, just update normally
         sidebar:update_content_with_history()
-        sidebar:create_todos_container()
+        sidebar:create_plan_container()
         sidebar:initialize_token_count()
         vim.schedule(function() sidebar:focus_input() end)
       end

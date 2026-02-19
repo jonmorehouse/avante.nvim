@@ -1101,6 +1101,12 @@ function M._stream_acp(opts)
             session_state.last_plan_entries = update.entries or {}
             Utils.debug("Plan update received with " .. #(update.entries or {}) .. " entries")
 
+            -- Push plan entries through AcpThread if available (syncs plan_entries and fires callbacks)
+            local sidebar = require("avante").get()
+            if sidebar and sidebar.acp_thread then
+              sidebar.acp_thread.plan_entries = update.entries or {}
+            end
+
             local todos = {}
             for idx, entry in ipairs(update.entries or {}) do
               local status = "todo"
@@ -1394,6 +1400,15 @@ function M._stream_acp(opts)
             return
           end
 
+          -- Surface question text for AskUserQuestion tool calls
+          local is_ask_question = tool_call.title and tool_call.title:match("AskUserQuestion")
+          if is_ask_question and tool_call.rawInput then
+            local q_text = tool_call.rawInput.question or tool_call.rawInput.text
+            if q_text then
+              sidebar.permission_question_text = q_text
+            end
+          end
+
           local description = HistoryRender.get_tool_display_name(message)
           LLMToolHelpers.confirm(description, function(ok)
             local acp_mapped_options = ACPConfirmAdapter.map_acp_options(options)
@@ -1406,6 +1421,7 @@ function M._stream_acp(opts)
               callback(acp_mapped_options.no)
             end
 
+            sidebar.permission_question_text = nil
             sidebar.scroll = true
             sidebar._history_cache_invalidated = true
             sidebar:update_content("")

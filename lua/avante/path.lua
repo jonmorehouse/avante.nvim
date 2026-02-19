@@ -176,6 +176,7 @@ function History.new(bufnr)
     entries = {},
     messages = {},
     todos = {},
+    tags = {},
     filename = filepath_to_filename(filepath),
     working_directory = vim.fn.getcwd(),
   }
@@ -197,6 +198,8 @@ function History.from_file(filepath)
         if not vim.islist(history.entries) then history.entries = {} end
         if not vim.islist(history.messages) then history.messages = {} end
         if not vim.islist(history.todos) then history.todos = {} end
+        if not vim.islist(history.tags) then history.tags = {} end
+        if history.starred == nil then history.starred = false end
         ---@cast history avante.ChatHistory
         history.filename = filepath_to_filename(filepath)
         return history

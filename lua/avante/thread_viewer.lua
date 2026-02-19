@@ -51,9 +51,27 @@ local function get_or_create_acp_client()
     return _acp_client_cache, nil
   end
 
-  -- Create new ACP client
-  local provider_config = Config.providers and Config.providers["claude"]
-  if not provider_config or not provider_config.acp_args then
+  -- Try to reuse the sidebar's existing ACP client first
+  local ok, Avante = pcall(require, "avante")
+  if ok then
+    local sidebar = Avante.get and Avante.get()
+    if sidebar and sidebar.acp_client and sidebar.acp_client:is_connected() then
+      _acp_client_cache = sidebar.acp_client
+      _acp_available = true
+      return _acp_client_cache, nil
+    end
+  end
+
+  -- Create new ACP client — try acp_providers first, then legacy providers config
+  local acp_config = nil
+  local current_provider = Config.provider
+  if Config.acp_providers and Config.acp_providers[current_provider] then
+    acp_config = Config.acp_providers[current_provider]
+  elseif Config.providers and Config.providers["claude"] and Config.providers["claude"].acp_args then
+    acp_config = Config.providers["claude"].acp_args
+  end
+
+  if not acp_config or not acp_config.command then
     _acp_available = false
     return nil, "ACP not configured"
   end
@@ -61,15 +79,15 @@ local function get_or_create_acp_client()
   -- Get current working directory and resolve environment variables with path-based overrides
   local cwd = vim.fn.getcwd()
   local resolved_env = EnvUtils.merge_env_with_overrides(
-    provider_config.acp_args.env or {},
-    provider_config.acp_args.envOverrides,
+    acp_config.env or {},
+    acp_config.envOverrides,
     cwd
   )
 
   local client = ACPClient:new({
     transport_type = "stdio",
-    command = provider_config.acp_args.command,
-    args = provider_config.acp_args.args or {},
+    command = acp_config.command,
+    args = acp_config.args or {},
     env = resolved_env,
     timeout = 5000,
   })
@@ -239,6 +257,7 @@ local function create_synthetic_history(session_info)
     messages = {},
     entries = {},
     todos = {},
+    tags = { "external" },
     memory = nil,
     filename = "__external_acp_" .. session_info.session_id,
     system_prompt = nil,
@@ -256,19 +275,34 @@ local function format_thread_entry(history)
   local messages = History.get_history_messages(history)
   local timestamp = #messages > 0 and messages[#messages].timestamp or history.timestamp
   local working_dir = history.working_directory or "unknown"
-  
+
   -- Extract just the directory name for display
   local dir_name = working_dir:match("([^/]+)$") or working_dir
-  
+
+  -- Star indicator
+  local star = history.starred and "* " or "  "
+
   -- Add ACP indicator if this is an ACP session
   local acp_indicator = history.acp_session_id and " [ACP]" or ""
-  
-  -- Format: [dir_name] title - timestamp (msg_count messages) [ACP]
-  return string.format("[%s] %s - %s (%d)%s", 
-    dir_name, 
-    history.title, 
-    timestamp, 
+
+  -- Add tags as badges
+  local tags_str = ""
+  if history.tags and #history.tags > 0 then
+    local tag_badges = {}
+    for _, tag in ipairs(history.tags) do
+      table.insert(tag_badges, "#" .. tag)
+    end
+    tags_str = " " .. table.concat(tag_badges, " ")
+  end
+
+  -- Format: * [dir_name] title - timestamp (msg_count) #tag1 #tag2 [ACP]
+  return string.format("%s[%s] %s - %s (%d)%s%s",
+    star,
+    dir_name,
+    history.title,
+    timestamp,
     #messages,
+    tags_str,
     acp_indicator
   )
 end
@@ -356,6 +390,18 @@ local function show_telescope_picker(histories, bufnr, cb, pickers, finders, con
             table.insert(preview_lines, "**ACP Session ID:** " .. history.acp_session_id)
             table.insert(preview_lines, "")
           end
+          if history.tags and #history.tags > 0 then
+            table.insert(preview_lines, "**Tags:** " .. table.concat(history.tags, ", "))
+            table.insert(preview_lines, "")
+          end
+          if history.parent_thread_id then
+            table.insert(preview_lines, "**Forked from:** " .. history.parent_thread_id)
+            table.insert(preview_lines, "")
+          end
+          if history.starred then
+            table.insert(preview_lines, "**Starred:** yes")
+            table.insert(preview_lines, "")
+          end
           table.insert(preview_lines, "---")
           table.insert(preview_lines, "")
           
@@ -404,6 +450,40 @@ local function show_telescope_picker(histories, bufnr, cb, pickers, finders, con
             -- Wrap close in pcall to handle potential autocmd errors
             pcall(actions.close, prompt_bufnr)
             -- Reopen the picker to refresh (with slight delay to avoid conflicts)
+            vim.schedule(function()
+              M.open_with_telescope(bufnr, cb)
+            end)
+          end
+        end)
+
+        -- Add rename mapping with 'r'
+        map("n", "r", function()
+          local selection = action_state.get_selected_entry()
+          if selection and selection.history and not selection.is_new_thread then
+            local current_title = selection.history.title or ""
+            vim.ui.input({ prompt = "Rename thread: ", default = current_title }, function(new_title)
+              if new_title and new_title ~= "" then
+                selection.history.title = new_title
+                Path.history.save(bufnr, selection.history)
+                Utils.info("Renamed thread to: " .. new_title)
+                pcall(actions.close, prompt_bufnr)
+                vim.schedule(function()
+                  M.open_with_telescope(bufnr, cb)
+                end)
+              end
+            end)
+          end
+        end)
+
+        -- Add star toggle mapping with 's'
+        map("n", "s", function()
+          local selection = action_state.get_selected_entry()
+          if selection and selection.history and not selection.is_new_thread then
+            selection.history.starred = not selection.history.starred
+            Path.history.save(bufnr, selection.history)
+            local label = selection.history.starred and "Starred" or "Unstarred"
+            Utils.info(label .. ": " .. (selection.history.title or selection.value))
+            pcall(actions.close, prompt_bufnr)
             vim.schedule(function()
               M.open_with_telescope(bufnr, cb)
             end)
@@ -488,8 +568,11 @@ function M.open_with_telescope(bufnr, cb)
       table.insert(deduplicated_histories, history)
     end
     
-    -- Sort by timestamp (most recent first)
+    -- Sort: starred first, then by timestamp (most recent first)
     table.sort(deduplicated_histories, function(a, b)
+      local a_starred = a.starred or false
+      local b_starred = b.starred or false
+      if a_starred ~= b_starred then return a_starred end
       local a_msgs = History.get_history_messages(a)
       local b_msgs = History.get_history_messages(b)
       local a_time = #a_msgs > 0 and a_msgs[#a_msgs].timestamp or a.timestamp

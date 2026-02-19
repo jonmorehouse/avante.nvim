@@ -60,11 +60,36 @@ function M.check()
     end
   end
 
+  -- Check ACP backend
+  M.check_acp_backend()
+
   -- Check TreeSitter dependencies
   M.check_treesitter()
-  
+
   -- Check notification tools
   M.check_notification_tools()
+end
+
+-- Check ACP backend availability
+function M.check_acp_backend()
+  H.start("ACP Backend")
+  local acp_backend = Config.acp_backend or "lua"
+  H.info("Configured ACP backend: " .. acp_backend)
+
+  if acp_backend == "rust" then
+    local ok, _ = pcall(require, "avante_acp")
+    if ok then
+      H.ok("Rust ACP backend (avante_acp native module) is available")
+    else
+      H.warn("Rust ACP backend configured but native module 'avante_acp' not found. Will fall back to Lua backend.")
+    end
+  else
+    H.ok("Using Lua ACP backend (built-in)")
+    local ok, _ = pcall(require, "avante_acp")
+    if ok then
+      H.info("Rust ACP backend (avante_acp) is also available — set acp_backend = 'rust' to use it")
+    end
+  end
 end
 
 -- Check TreeSitter functionality and parsers

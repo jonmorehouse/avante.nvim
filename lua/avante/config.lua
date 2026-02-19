@@ -31,6 +31,12 @@ M._defaults = {
   ---@alias avante.Mode "agentic" | "legacy"
   ---@type avante.Mode
   mode = "agentic",
+  --- ACP backend implementation to use.
+  --- "lua" uses the built-in Lua JSON-RPC client.
+  --- "rust" uses the native Rust ACP SDK (requires avante-acp native module).
+  ---@alias avante.AcpBackend "lua" | "rust"
+  ---@type avante.AcpBackend
+  acp_backend = "lua",
   ---@alias avante.ProviderName "claude" | "openai" | "azure" | "gemini" | "vertex" | "cohere" | "copilot" | "bedrock" | "ollama" | "watsonx_code_assistant" | string
   ---@type avante.ProviderName
   provider = "claude",
