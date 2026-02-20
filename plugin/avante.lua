@@ -100,10 +100,8 @@ end, {
 })
 cmd("ChatNew", function(opts)
   local args = Utils.parse_args(opts.fargs)
-  args.ask = false
-  args.new_chat = true
-  require("avante.api").ask(args)
-end, { desc = "avante: create new chat", nargs = "*", complete = ask_complete })
+  require("avante.api").new_chat_picker(args)
+end, { desc = "avante: create new chat (with worktree picker if configured)", nargs = "*", complete = ask_complete })
 cmd("Toggle", function() require("avante").toggle() end, { desc = "avante: toggle AI panel" })
 cmd("Build", function(opts)
   local args = Utils.parse_args(opts.fargs)
@@ -184,6 +182,7 @@ cmd("ShowRepoMap", function() require("avante.repo_map").show() end, { desc = "a
 cmd("Models", function() require("avante.model_selector").open() end, { desc = "avante: show models" })
 cmd("History", function() require("avante.api").select_history() end, { desc = "avante: show histories" })
 cmd("Threads", function() require("avante.api").view_threads() end, { desc = "avante: view all threads with telescope" })
+cmd("PinnedThreads", function() require("avante.api").view_pinned_threads() end, { desc = "avante: view pinned threads with unread detection" })
 cmd("PlanModeToggle", function() require("avante.api").toggle_plan_mode() end, { desc = "avante: toggle plan-only mode" })
 cmd("PlanMode", function() require("avante.api").toggle_plan_mode() end, { desc = "avante: toggle plan-only mode (deprecated, use PlanModeToggle)" })
 cmd("Debug", function()
@@ -266,3 +265,159 @@ cmd("Modes", function()
   vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = buf, noremap = true, silent = true })
   vim.keymap.set("n", "<Esc>", "<cmd>close<cr>", { buffer = buf, noremap = true, silent = true })
 end, { desc = "avante: show available session modes" })
+cmd("Options", function(args)
+  require("avante.config_option_selector").open({
+    category = args.args ~= "" and args.args or nil,
+  })
+end, { nargs = "?", desc = "avante: open agent config options selector" })
+cmd("Plan", function()
+  local sidebar = require("avante").get()
+  if not sidebar then
+    Utils.error("No sidebar found. Open Avante first with :AvanteChat or :AvanteChatNew")
+    return
+  end
+  -- Focus the plan container if it exists in the sidebar
+  if sidebar.containers and sidebar.containers.plan and sidebar.containers.plan.winid
+    and vim.api.nvim_win_is_valid(sidebar.containers.plan.winid) then
+    vim.api.nvim_set_current_win(sidebar.containers.plan.winid)
+    return
+  end
+  -- If no plan container but we have plan entries, create the container first
+  if sidebar.chat_history and sidebar.chat_history.todos and #sidebar.chat_history.todos > 0 then
+    sidebar:create_plan_container()
+    if sidebar.containers and sidebar.containers.plan and sidebar.containers.plan.winid
+      and vim.api.nvim_win_is_valid(sidebar.containers.plan.winid) then
+      vim.api.nvim_set_current_win(sidebar.containers.plan.winid)
+      return
+    end
+  end
+  Utils.info("No plan available")
+end, { desc = "avante: focus the plan pane in the sidebar" })
+cmd("FollowToggle", function()
+  local sidebar = require("avante").get()
+  if not sidebar then
+    Utils.error("No sidebar found. Open Avante first with :AvanteChat or :AvanteChatNew")
+    return
+  end
+  sidebar.follow_mode = not sidebar.follow_mode
+  local status = sidebar.follow_mode and "enabled" or "disabled"
+  Utils.info("Follow mode " .. status)
+  sidebar._history_cache_invalidated = true
+  sidebar:update_content("")
+end, { desc = "avante: toggle follow mode (auto-jump to agent edits)" })
+cmd("Review", function()
+  local sidebar = require("avante").get()
+  if not sidebar then
+    Utils.error("No sidebar found. Open Avante first with :AvanteChat or :AvanteChatNew")
+    return
+  end
+  local session_ctx = sidebar._current_session_ctx
+  if not session_ctx then
+    Utils.error("No active session")
+    return
+  end
+  require("avante.review").open(session_ctx)
+end, { desc = "avante: review all agent changes with per-hunk accept/reject" })
+cmd("ChangedFiles", function()
+  require("avante.changed_files").open()
+end, { desc = "avante: show location list of files changed by the agent" })
+cmd("ThreadRename", function(opts)
+  local sidebar = require("avante").get()
+  if not sidebar then
+    Utils.error("No sidebar found")
+    return
+  end
+  local new_name = vim.trim(opts.args or "")
+  if new_name == "" then
+    vim.ui.input({ prompt = "Thread name: ", default = sidebar.chat_history and sidebar.chat_history.title or "" }, function(input)
+      if input and input ~= "" then
+        sidebar:rename_thread(input)
+      end
+    end)
+  else
+    sidebar:rename_thread(new_name)
+  end
+end, { desc = "avante: rename current thread", nargs = "?" })
+cmd("ThreadFork", function()
+  local sidebar = require("avante").get()
+  if not sidebar then
+    Utils.error("No sidebar found")
+    return
+  end
+  if not sidebar.chat_history then
+    Utils.error("No active thread to fork")
+    return
+  end
+  sidebar:fork_thread()
+end, { desc = "avante: fork current thread at current position" })
+cmd("Context", function()
+  local sidebar = require("avante").get()
+  if not sidebar then
+    Utils.error("No sidebar found")
+    return
+  end
+  -- Toggle context visibility in the sidebar
+  if sidebar._context_panel_visible then
+    sidebar._context_panel_visible = false
+    Utils.info("Context panel hidden")
+  else
+    sidebar._context_panel_visible = true
+    Utils.info("Context panel shown")
+  end
+  -- Re-render to show/hide context
+  if sidebar.render_result then sidebar:render_result() end
+end, { desc = "avante: toggle context visibility panel" })
+cmd("PromptPreview", function()
+  local sidebar = require("avante").get()
+  if not sidebar then
+    Utils.error("No sidebar found")
+    return
+  end
+  -- Build the prompt that would be sent and show it in a scratch buffer
+  local Llm = require("avante.llm")
+  local prompt_opts = Llm.generate_prompts({
+    bufnr = sidebar.code.bufnr,
+    ask = true,
+    instructions = "",
+    mode = Config.mode,
+  })
+  local lines = {}
+  table.insert(lines, "# Prompt Preview")
+  table.insert(lines, "")
+  table.insert(lines, "## System Prompt")
+  table.insert(lines, "")
+  table.insert(lines, "```")
+  table.insert(lines, prompt_opts.system_prompt or "(none)")
+  table.insert(lines, "```")
+  table.insert(lines, "")
+  table.insert(lines, "## Messages (" .. #(prompt_opts.messages or {}) .. ")")
+  table.insert(lines, "")
+  for i, msg in ipairs(prompt_opts.messages or {}) do
+    table.insert(lines, "### " .. i .. ". " .. (msg.role or "unknown"))
+    table.insert(lines, "```")
+    local content = msg.content or ""
+    if type(content) == "table" then content = vim.inspect(content) end
+    table.insert(lines, content)
+    table.insert(lines, "```")
+    table.insert(lines, "")
+  end
+  -- Selected files
+  if sidebar.file_selector then
+    local files = sidebar.file_selector:get_selected_filepaths()
+    if #files > 0 then
+      table.insert(lines, "## Selected Files (" .. #files .. ")")
+      table.insert(lines, "")
+      for _, f in ipairs(files) do
+        table.insert(lines, "- " .. f)
+      end
+      table.insert(lines, "")
+    end
+  end
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_set_option_value("modifiable", false, { buf = buf })
+  vim.api.nvim_set_option_value("filetype", "markdown", { buf = buf })
+  vim.api.nvim_set_option_value("bufhidden", "wipe", { buf = buf })
+  vim.cmd("split")
+  vim.api.nvim_win_set_buf(0, buf)
+end, { desc = "avante: preview the full prompt in a scratch buffer" })

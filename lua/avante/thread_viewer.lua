@@ -51,9 +51,27 @@ local function get_or_create_acp_client()
     return _acp_client_cache, nil
   end
 
-  -- Create new ACP client
-  local provider_config = Config.providers and Config.providers["claude"]
-  if not provider_config or not provider_config.acp_args then
+  -- Try to reuse the sidebar's existing ACP client first
+  local ok, Avante = pcall(require, "avante")
+  if ok then
+    local sidebar = Avante.get and Avante.get()
+    if sidebar and sidebar.acp_client and sidebar.acp_client:is_connected() then
+      _acp_client_cache = sidebar.acp_client
+      _acp_available = true
+      return _acp_client_cache, nil
+    end
+  end
+
+  -- Create new ACP client — try acp_providers first, then legacy providers config
+  local acp_config = nil
+  local current_provider = Config.provider
+  if Config.acp_providers and Config.acp_providers[current_provider] then
+    acp_config = Config.acp_providers[current_provider]
+  elseif Config.providers and Config.providers["claude"] and Config.providers["claude"].acp_args then
+    acp_config = Config.providers["claude"].acp_args
+  end
+
+  if not acp_config or not acp_config.command then
     _acp_available = false
     return nil, "ACP not configured"
   end
@@ -61,15 +79,15 @@ local function get_or_create_acp_client()
   -- Get current working directory and resolve environment variables with path-based overrides
   local cwd = vim.fn.getcwd()
   local resolved_env = EnvUtils.merge_env_with_overrides(
-    provider_config.acp_args.env or {},
-    provider_config.acp_args.envOverrides,
+    acp_config.env or {},
+    acp_config.envOverrides,
     cwd
   )
 
   local client = ACPClient:new({
     transport_type = "stdio",
-    command = provider_config.acp_args.command,
-    args = provider_config.acp_args.args or {},
+    command = acp_config.command,
+    args = acp_config.args or {},
     env = resolved_env,
     timeout = 5000,
   })
@@ -239,6 +257,7 @@ local function create_synthetic_history(session_info)
     messages = {},
     entries = {},
     todos = {},
+    tags = { "external" },
     memory = nil,
     filename = "__external_acp_" .. session_info.session_id,
     system_prompt = nil,
@@ -251,25 +270,52 @@ local function create_synthetic_history(session_info)
 end
 
 ---@param history avante.ChatHistory
+---@param acp_message_counts? table<string, integer> Map of session_id to ACP message count
 ---@return string
-local function format_thread_entry(history)
+local function format_thread_entry(history, acp_message_counts)
   local messages = History.get_history_messages(history)
   local timestamp = #messages > 0 and messages[#messages].timestamp or history.timestamp
   local working_dir = history.working_directory or "unknown"
-  
+
   -- Extract just the directory name for display
   local dir_name = working_dir:match("([^/]+)$") or working_dir
-  
+
+  -- Pin indicator
+  local pin = history.pinned and "* " or "  "
+
   -- Add ACP indicator if this is an ACP session
   local acp_indicator = history.acp_session_id and " [ACP]" or ""
-  
-  -- Format: [dir_name] title - timestamp (msg_count messages) [ACP]
-  return string.format("[%s] %s - %s (%d)%s", 
-    dir_name, 
-    history.title, 
-    timestamp, 
+
+  -- Add tags as badges
+  local tags_str = ""
+  if history.tags and #history.tags > 0 then
+    local tag_badges = {}
+    for _, tag in ipairs(history.tags) do
+      table.insert(tag_badges, "#" .. tag)
+    end
+    tags_str = " " .. table.concat(tag_badges, " ")
+  end
+
+  -- Unread indicator
+  local unread = ""
+  if acp_message_counts and history.acp_session_id then
+    local acp_count = acp_message_counts[history.acp_session_id]
+    local last_seen = history.last_seen_message_count or #messages
+    if acp_count and acp_count > last_seen then
+      unread = " [NEW]"
+    end
+  end
+
+  -- Format: * [dir_name] title - timestamp (msg_count) #tag1 #tag2 [ACP] [NEW]
+  return string.format("%s[%s] %s - %s (%d)%s%s%s",
+    pin,
+    dir_name,
+    history.title,
+    timestamp,
     #messages,
-    acp_indicator
+    tags_str,
+    acp_indicator,
+    unread
   )
 end
 
@@ -283,30 +329,40 @@ end
 ---@param actions table
 ---@param action_state table
 ---@param previewers table
-local function show_telescope_picker(histories, bufnr, cb, pickers, finders, conf, actions, action_state, previewers)
+---@param opts? { filter?: string, show_unread?: boolean, acp_message_counts?: table<string, integer> }
+local function show_telescope_picker(histories, bufnr, cb, pickers, finders, conf, actions, action_state, previewers, opts)
+  opts = opts or {}
+  local acp_message_counts = opts.acp_message_counts or {}
+
   if #histories == 0 then
-    Utils.warn("No thread history found.")
+    if opts.filter == "pinned" then
+      Utils.warn("No pinned threads found. Pin a thread with 's' in :AvanteThreads or use /pin.")
+    else
+      Utils.warn("No thread history found.")
+    end
     return
   end
 
   -- Create entries for telescope
   local entries = {}
-  
-  -- Add "Create New Thread" as the first entry
-  table.insert(entries, {
-    value = "__create_new__",
-    display = "[+] Create New Thread",
-    ordinal = "[+] Create New Thread",
-    is_new_thread = true,
-  })
-  
+
+  -- Add "Create New Thread" as the first entry (but not in filtered views)
+  if not opts.filter then
+    table.insert(entries, {
+      value = "__create_new__",
+      display = "[+] Create New Thread",
+      ordinal = "[+] Create New Thread",
+      is_new_thread = true,
+    })
+  end
+
   for _, history in ipairs(histories) do
-    local display_text = format_thread_entry(history)
+    local display_text = format_thread_entry(history, acp_message_counts)
     -- Add [EXTERNAL] tag for sessions without Avante history
     if history._is_external then
       display_text = display_text .. " [EXTERNAL]"
     end
-    
+
     table.insert(entries, {
       value = history.filename,
       display = display_text,
@@ -315,9 +371,11 @@ local function show_telescope_picker(histories, bufnr, cb, pickers, finders, con
     })
   end
 
+  local prompt_title = (opts.filter == "pinned") and "Avante Pinned Threads" or "Avante Threads"
+
   pickers
     .new({}, {
-      prompt_title = "Avante Threads",
+      prompt_title = prompt_title,
       finder = finders.new_table({
         results = entries,
         entry_maker = function(entry)
@@ -354,6 +412,18 @@ local function show_telescope_picker(histories, bufnr, cb, pickers, finders, con
           end
           if history.acp_session_id then
             table.insert(preview_lines, "**ACP Session ID:** " .. history.acp_session_id)
+            table.insert(preview_lines, "")
+          end
+          if history.tags and #history.tags > 0 then
+            table.insert(preview_lines, "**Tags:** " .. table.concat(history.tags, ", "))
+            table.insert(preview_lines, "")
+          end
+          if history.parent_thread_id then
+            table.insert(preview_lines, "**Forked from:** " .. history.parent_thread_id)
+            table.insert(preview_lines, "")
+          end
+          if history.pinned then
+            table.insert(preview_lines, "**Pinned:** yes")
             table.insert(preview_lines, "")
           end
           table.insert(preview_lines, "---")
@@ -405,7 +475,41 @@ local function show_telescope_picker(histories, bufnr, cb, pickers, finders, con
             pcall(actions.close, prompt_bufnr)
             -- Reopen the picker to refresh (with slight delay to avoid conflicts)
             vim.schedule(function()
-              M.open_with_telescope(bufnr, cb)
+              M.open_with_telescope(bufnr, cb, opts)
+            end)
+          end
+        end)
+
+        -- Add rename mapping with 'r'
+        map("n", "r", function()
+          local selection = action_state.get_selected_entry()
+          if selection and selection.history and not selection.is_new_thread then
+            local current_title = selection.history.title or ""
+            vim.ui.input({ prompt = "Rename thread: ", default = current_title }, function(new_title)
+              if new_title and new_title ~= "" then
+                selection.history.title = new_title
+                Path.history.save(bufnr, selection.history)
+                Utils.info("Renamed thread to: " .. new_title)
+                pcall(actions.close, prompt_bufnr)
+                vim.schedule(function()
+                  M.open_with_telescope(bufnr, cb, opts)
+                end)
+              end
+            end)
+          end
+        end)
+
+        -- Add pin toggle mapping with 's'
+        map("n", "s", function()
+          local selection = action_state.get_selected_entry()
+          if selection and selection.history and not selection.is_new_thread then
+            selection.history.pinned = not selection.history.pinned
+            Path.history.save(bufnr, selection.history)
+            local label = selection.history.pinned and "Pinned" or "Unpinned"
+            Utils.info(label .. ": " .. (selection.history.title or selection.value))
+            pcall(actions.close, prompt_bufnr)
+            vim.schedule(function()
+              M.open_with_telescope(bufnr, cb, opts)
             end)
           end
         end)
@@ -418,7 +522,10 @@ end
 
 ---@param bufnr integer
 ---@param cb fun(filename: string)
-function M.open_with_telescope(bufnr, cb)
+---@param opts? { filter?: string, show_unread?: boolean }
+function M.open_with_telescope(bufnr, cb, opts)
+  opts = opts or {}
+
   local has_telescope, _ = pcall(require, "telescope")
   if not has_telescope then
     Utils.warn("Telescope is not installed. Please install telescope.nvim to use :AvanteThreads")
@@ -437,9 +544,17 @@ function M.open_with_telescope(bufnr, cb)
 
   -- Fetch external ACP sessions asynchronously
   scan_external_acp_sessions(function(external_sessions)
+    -- Build ACP message counts lookup for unread detection
+    local acp_message_counts = {}
+    for _, session_info in ipairs(external_sessions) do
+      if session_info.session_id and session_info.message_count then
+        acp_message_counts[session_info.session_id] = session_info.message_count
+      end
+    end
+
     -- Create deduplicated map by session ID
     local session_map = {}
-    
+
     -- First, add all local histories (they have priority - more complete info)
     for _, history in ipairs(histories) do
       local session_id = history.acp_session_id
@@ -469,7 +584,7 @@ function M.open_with_telescope(bufnr, cb)
         end
       end
     end
-    
+
     -- Now add external sessions that don't exist in local histories
     for _, session_info in ipairs(external_sessions) do
       local session_id = session_info.session_id
@@ -481,43 +596,81 @@ function M.open_with_telescope(bufnr, cb)
         Utils.debug("Skipping external session already in local histories: " .. session_id)
       end
     end
-    
+
     -- Convert map back to array
     local deduplicated_histories = {}
     for _, history in pairs(session_map) do
       table.insert(deduplicated_histories, history)
     end
-    
-    -- Sort by timestamp (most recent first)
+
+    -- Sort: pinned first, then by timestamp (most recent first)
     table.sort(deduplicated_histories, function(a, b)
+      local a_pinned = a.pinned or false
+      local b_pinned = b.pinned or false
+      if a_pinned ~= b_pinned then return a_pinned end
       local a_msgs = History.get_history_messages(a)
       local b_msgs = History.get_history_messages(b)
       local a_time = #a_msgs > 0 and a_msgs[#a_msgs].timestamp or a.timestamp
       local b_time = #b_msgs > 0 and b_msgs[#b_msgs].timestamp or b.timestamp
       return a_time > b_time
     end)
-    
+
+    -- Apply filter
+    if opts.filter == "pinned" then
+      deduplicated_histories = vim.tbl_filter(function(h) return h.pinned == true end, deduplicated_histories)
+    end
+
     Utils.info("Loaded " .. #deduplicated_histories .. " unique threads (deduplicated from " .. #histories .. " local + " .. #external_sessions .. " external)")
-    
+
+    -- Pass acp_message_counts through opts for the picker
+    local picker_opts = vim.tbl_extend("force", opts, { acp_message_counts = acp_message_counts })
+
     -- Continue with telescope picker inside the callback
     vim.schedule(function()
-      show_telescope_picker(deduplicated_histories, bufnr, cb, pickers, finders, conf, actions, action_state, previewers)
+      show_telescope_picker(deduplicated_histories, bufnr, cb, pickers, finders, conf, actions, action_state, previewers, picker_opts)
     end)
   end)
 end
 
 ---@param bufnr integer
 ---@param cb fun(filename: string)
-function M.open(bufnr, cb)
+---@param opts? { filter?: string, show_unread?: boolean }
+function M.open(bufnr, cb, opts)
   -- Try to use telescope first, fall back to native selector
   local has_telescope, _ = pcall(require, "telescope")
-  
+
   if has_telescope then
-    M.open_with_telescope(bufnr, cb)
+    M.open_with_telescope(bufnr, cb, opts)
   else
     -- Fall back to the native history selector
     require("avante.history_selector").open(bufnr, cb)
   end
+end
+
+---Check pinned threads for unread messages via ACP session/list
+---@param pinned_histories avante.ChatHistory[] Only pinned histories with acp_session_id
+---@param callback fun(unread_count: integer)
+function M.check_pinned_unread(pinned_histories, callback)
+  fetch_sessions_from_acp(function(external_sessions)
+    -- Build lookup of ACP message counts
+    local acp_counts = {}
+    for _, s in ipairs(external_sessions) do
+      if s.session_id and s.message_count then
+        acp_counts[s.session_id] = s.message_count
+      end
+    end
+
+    local unread = 0
+    for _, history in ipairs(pinned_histories) do
+      local acp_count = acp_counts[history.acp_session_id]
+      local last_seen = history.last_seen_message_count or #(history.messages or {})
+      if acp_count and acp_count > last_seen then
+        unread = unread + 1
+      end
+    end
+
+    vim.schedule(function() callback(unread) end)
+  end)
 end
 
 return M

@@ -11,5 +11,6 @@
     "figma",
     "nuon-cms",
     "ctl-api-db"
-  ]
+  ],
+  "enableAllProjectMcpServers": true
 }

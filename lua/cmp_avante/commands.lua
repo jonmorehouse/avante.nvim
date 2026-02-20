@@ -33,12 +33,15 @@ function CommandsSource:complete(params, callback)
   local commands = Utils.get_commands()
 
   local items = {}
+  local cmp_kinds = require("cmp").lsp.CompletionItemKind
 
   for _, command in ipairs(commands) do
+    local item_kind = command.source == "acp" and cmp_kinds.Interface or kind
+    local detail = (command.source == "acp" and "[ACP] " or "") .. (command.details or "")
     table.insert(items, {
       label = "/" .. command.name,
-      kind = kind,
-      detail = command.details,
+      kind = item_kind,
+      detail = detail,
       data = {
         name = command.name,
       },

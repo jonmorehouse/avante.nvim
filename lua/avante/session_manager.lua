@@ -148,7 +148,7 @@ function M.restore_session(sidebar, session_state)
       -- Restore todos
       if session_state.todos and #session_state.todos > 0 then
         sidebar.chat_history.todos = session_state.todos
-        sidebar:create_todos_container()
+        sidebar:create_plan_container()
       end
     end
   end

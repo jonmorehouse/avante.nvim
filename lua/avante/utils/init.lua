@@ -1667,6 +1667,114 @@ function M.llm_tool_param_fields_to_json_schema(fields)
   return properties, required
 end
 
+--- Build todos summary text from chat history
+---@param history avante.ChatHistory|nil
+---@return string|nil
+function M.plan_build_todos_text(history)
+  if not history or not history.todos or #history.todos == 0 then return nil end
+  local todos = history.todos
+
+  local pending_todos = {}
+  local in_progress_todos = {}
+  local completed_todos = {}
+
+  for _, todo in ipairs(todos) do
+    if todo.status == "pending" or todo.status == "todo" then
+      table.insert(pending_todos, todo)
+    elseif todo.status == "in_progress" or todo.status == "doing" then
+      table.insert(in_progress_todos, todo)
+    elseif todo.status == "completed" or todo.status == "done" then
+      table.insert(completed_todos, todo)
+    end
+  end
+
+  local text = "**Current Plan**\n\n"
+
+  if #in_progress_todos > 0 then
+    text = text .. "**In Progress:**\n"
+    for _, todo in ipairs(in_progress_todos) do
+      text = text .. "- 🔄 " .. todo.content .. "\n"
+    end
+    text = text .. "\n"
+  end
+
+  if #pending_todos > 0 then
+    text = text .. "**Pending:**\n"
+    for _, todo in ipairs(pending_todos) do
+      text = text .. "- ⏳ " .. todo.content .. "\n"
+    end
+    text = text .. "\n"
+  end
+
+  if #completed_todos > 0 then
+    text = text .. "**Completed:**\n"
+    for _, todo in ipairs(completed_todos) do
+      text = text .. "- ✅ " .. todo.content .. "\n"
+    end
+    text = text .. "\n"
+  end
+
+  text = text .. string.format("\n**Progress:** %d/%d tasks completed", #completed_todos, #todos)
+  return text
+end
+
+--- Find plan file path from chat history messages
+--- Claude Code writes plans to ~/.claude/plans/*.md via the Write tool
+---@param history avante.ChatHistory|nil
+---@return string|nil
+function M.plan_find_file_path(history)
+  if not history then return nil end
+  local ok, History = pcall(require, "avante.history")
+  if not ok then return nil end
+  local messages = History.get_history_messages(history)
+  if not messages then return nil end
+
+  local plan_file_path = nil
+  for i = #messages, 1, -1 do
+    local msg = messages[i]
+    local content = msg.message and msg.message.content
+    if type(content) == "table" then
+      for _, item in ipairs(content) do
+        if item.type == "tool_use" then
+          local input = item.input or {}
+          local path = input.file_path or input.path or ""
+          if path:match("%.claude/plans/") and path:match("%.md$") then
+            plan_file_path = path
+            break
+          end
+        end
+      end
+    end
+    if not plan_file_path and msg.acp_tool_call then
+      local tc = msg.acp_tool_call
+      local title = tc.title or ""
+      if title:match("Write") or title:match("write") then
+        local raw = tc.rawInput or {}
+        local path = raw.file_path or raw.path or ""
+        if path:match("%.claude/plans/") and path:match("%.md$") then
+          plan_file_path = path
+        end
+      end
+    end
+    if plan_file_path then break end
+  end
+  return plan_file_path
+end
+
+--- Read a plan file from disk, expanding ~ paths
+---@param plan_file_path string|nil
+---@return string|nil
+function M.plan_read_file(plan_file_path)
+  if not plan_file_path then return nil end
+  local expanded = plan_file_path:gsub("^~", vim.fn.expand("~"))
+  expanded = vim.fn.fnamemodify(expanded, ":p")
+  local file = io.open(expanded, "r")
+  if not file then return nil end
+  local content = file:read("*a")
+  file:close()
+  return content
+end
+
 ---@return AvanteSlashCommand[]
 function M.get_commands()
   local Config = require("avante.config")
@@ -1700,7 +1808,9 @@ function M.get_commands()
       description = "/dir [path] - Add directory to context",
       name = "dir"
     },
-    { description = "Show current plan", name = "plan" },
+    { description = "Show current plan progress and file", name = "plan" },
+    { description = "Show plan file in chat window", name = "view-plan" },
+    { description = "Open plan file in a buffer", name = "open-plan" },
     { description = "Toggle full-screen mode", name = "toggle-full-screen" },
     { description = "Toggle plan-only mode", name = "toggle-plan-mode" },
     { description = "Toggle follow agent edits", name = "toggle-follow" },
@@ -1714,6 +1824,10 @@ function M.get_commands()
       description = "/prompt - Open telescope picker to select and reuse a prompt from history",
       name = "prompt"
     },
+    { description = "Fork the current thread", name = "fork" },
+    { description = "Show files changed in this session", name = "files" },
+    { description = "Pin the current thread", name = "pin" },
+    { description = "Unpin the current thread", name = "unpin" },
   }
 
   ---@type {[AvanteSlashCommandBuiltInName]: AvanteSlashCommandCallback}
@@ -1850,72 +1964,54 @@ Use `/compact` to update the memory with recent messages.]],
       if cb then cb(args) end
     end,
     plan = function(sidebar, args, cb)
-      -- Show the current plan from todos
       M.debug("/plan command called")
-      -- Ensure chat history is loaded
-      if not sidebar.chat_history then
-        M.debug("/plan: reloading chat history")
-        sidebar:reload_chat_history()
-      end
+      if not sidebar.chat_history then sidebar:reload_chat_history() end
 
       local history = sidebar.chat_history
-      M.debug("/plan: history=" .. tostring(history ~= nil) .. ", todos=" .. tostring(history and history.todos and #history.todos or 0))
-      if not history or not history.todos or #history.todos == 0 then
-        M.debug("/plan: no todos available, showing empty message")
-        sidebar:update_content("No plan available.\n\nTodos will appear here when you use plan mode or when the assistant creates a plan.", { focus = false, scroll = false })
-        if cb then cb(args) end
-        return
+      local todos_text = M.plan_build_todos_text(history)
+      local plan_file_path = M.plan_find_file_path(history)
+      local plan_file_content = M.plan_read_file(plan_file_path)
+
+      if todos_text and plan_file_content then
+        sidebar:update_content(todos_text .. "\n\n---\n\n" .. plan_file_content, { focus = false, scroll = false })
+      elseif todos_text then
+        sidebar:update_content(todos_text, { focus = false, scroll = false })
+      elseif plan_file_content then
+        sidebar:update_content(plan_file_content, { focus = false, scroll = false })
+      else
+        sidebar:update_content("No plan available.\n\nPlans will appear here when the agent creates a plan via plan mode.", { focus = false, scroll = false })
       end
-      
-      local todos = history.todos
-      local plan_text = "**Current Plan**\n\n"
-      
-      -- Group todos by status
-      local pending_todos = {}
-      local in_progress_todos = {}
-      local completed_todos = {}
-      
-      for _, todo in ipairs(todos) do
-        -- Handle both old status names (pending/in_progress/completed) and new ones (todo/doing/done)
-        if todo.status == "pending" or todo.status == "todo" then
-          table.insert(pending_todos, todo)
-        elseif todo.status == "in_progress" or todo.status == "doing" then
-          table.insert(in_progress_todos, todo)
-        elseif todo.status == "completed" or todo.status == "done" then
-          table.insert(completed_todos, todo)
+      if cb then cb(args) end
+    end,
+    ["view-plan"] = function(sidebar, args, cb)
+      if not sidebar.chat_history then sidebar:reload_chat_history() end
+      local plan_file_path = M.plan_find_file_path(sidebar.chat_history)
+      local content = M.plan_read_file(plan_file_path)
+      if content then
+        sidebar:update_content(content, { focus = false, scroll = false })
+      else
+        sidebar:update_content("No plan file found in this conversation.", { focus = false, scroll = false })
+      end
+      if cb then cb(args) end
+    end,
+    ["open-plan"] = function(sidebar, args, cb)
+      if not sidebar.chat_history then sidebar:reload_chat_history() end
+      local plan_file_path = M.plan_find_file_path(sidebar.chat_history)
+      if plan_file_path then
+        local expanded = plan_file_path:gsub("^~", vim.fn.expand("~"))
+        expanded = vim.fn.fnamemodify(expanded, ":p")
+        if vim.fn.filereadable(expanded) == 1 then
+          -- Open in the code window (sidebar windows have winfixbuf)
+          if sidebar.code and vim.api.nvim_win_is_valid(sidebar.code.winid) then
+            vim.api.nvim_set_current_win(sidebar.code.winid)
+          end
+          vim.cmd("edit " .. vim.fn.fnameescape(expanded))
+        else
+          M.warn("Plan file not found on disk: " .. expanded)
         end
+      else
+        M.warn("No plan file found in this conversation.")
       end
-      
-      -- Display in-progress todos
-      if #in_progress_todos > 0 then
-        plan_text = plan_text .. "**In Progress:**\n"
-        for _, todo in ipairs(in_progress_todos) do
-          plan_text = plan_text .. "- 🔄 " .. todo.content .. "\n"
-        end
-        plan_text = plan_text .. "\n"
-      end
-      
-      -- Display pending todos
-      if #pending_todos > 0 then
-        plan_text = plan_text .. "**Pending:**\n"
-        for _, todo in ipairs(pending_todos) do
-          plan_text = plan_text .. "- ⏳ " .. todo.content .. "\n"
-        end
-        plan_text = plan_text .. "\n"
-      end
-      
-      -- Display completed todos
-      if #completed_todos > 0 then
-        plan_text = plan_text .. "**Completed:**\n"
-        for _, todo in ipairs(completed_todos) do
-          plan_text = plan_text .. "- ✅ " .. todo.content .. "\n"
-        end
-        plan_text = plan_text .. "\n"
-      end
-      
-      plan_text = plan_text .. string.format("\n**Progress:** %d/%d tasks completed", #completed_todos, #todos)
-      
-      sidebar:update_content(plan_text, { focus = false, scroll = false })
       if cb then cb(args) end
     end,
     ["toggle-full-screen"] = function(sidebar, args, cb)
@@ -2026,6 +2122,36 @@ Use `/compact` to update the memory with recent messages.]],
       require("avante.prompt_selector").open()
       if cb then cb(args) end
     end,
+    fork = function(sidebar, args, cb)
+      sidebar:fork_thread()
+      if cb then cb(args) end
+    end,
+    files = function(sidebar, args, cb)
+      require("avante.changed_files").open()
+      if cb then cb(args) end
+    end,
+    pin = function(sidebar, args, cb)
+      if not sidebar.chat_history then
+        M.warn("No active thread to pin")
+      else
+        sidebar.chat_history.pinned = true
+        local Path = require("avante.path")
+        Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
+        M.info("Pinned: " .. (sidebar.chat_history.title or "current thread"))
+      end
+      if cb then cb(args) end
+    end,
+    unpin = function(sidebar, args, cb)
+      if not sidebar.chat_history then
+        M.warn("No active thread to unpin")
+      else
+        sidebar.chat_history.pinned = false
+        local Path = require("avante.path")
+        Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
+        M.info("Unpinned: " .. (sidebar.chat_history.title or "current thread"))
+      end
+      if cb then cb(args) end
+    end,
   }
 
   local builtin_commands = vim
@@ -2038,6 +2164,7 @@ Use `/compact` to update the memory with recent messages.]],
           description = item.description,
           callback = builtin_cbs[item.name],
           details = item.shorthelp and table.concat({ item.shorthelp, item.description }, "\n") or item.description,
+          source = "builtin",
         }
       end
     )

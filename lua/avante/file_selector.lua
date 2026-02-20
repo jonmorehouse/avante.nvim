@@ -30,29 +30,43 @@ end
 ---@param selected_paths string[] | nil
 ---@return nil
 function FileSelector:handle_path_selection(selected_paths)
-  if not selected_paths then return end
+  if not selected_paths then
+    -- Selection cancelled — reset browse directory
+    self._browse_dir = nil
+    return
+  end
 
   for _, selected_path in ipairs(selected_paths) do
-    -- Handle special "../ (parent directory)" option
+    -- Handle special "../ (parent directory)" option — navigate up and re-open picker
     if selected_path:match("^%.%./.*%(parent directory%)") then
-      selected_path = "../"
+      local current_dir = self._browse_dir or Utils.get_project_root()
+      local parent = vim.fn.fnamemodify(current_dir, ":h")
+      if parent == current_dir then
+        Utils.warn("Already at filesystem root")
+      else
+        self._browse_dir = parent
+        vim.schedule(function() self:show_selector_ui() end)
+      end
+      return
     end
-    
+
     -- Expand tilde for home directory
     if selected_path:sub(1, 2) == "~/" or selected_path == "~" then
       selected_path = vim.fn.expand(selected_path)
     end
-    
+
     local absolute_path
     if selected_path:sub(1, 1) == "/" or selected_path:match("^[A-Za-z]:") then
       absolute_path = selected_path
     else
-      absolute_path = Utils.to_absolute_path(selected_path)
+      -- Resolve relative to browse directory if set, otherwise project root
+      local base = self._browse_dir or vim.fn.getcwd()
+      absolute_path = vim.fn.simplify(base .. "/" .. selected_path)
     end
-    
+
     -- Normalize the path to resolve .., ., and redundant slashes
     absolute_path = vim.fn.simplify(absolute_path)
-    
+
     if vim.fn.isdirectory(absolute_path) == 1 then
       -- Check the directory_mode configuration
       if Config.file_selector.directory_mode == "recursive" then
@@ -74,6 +88,8 @@ function FileSelector:handle_path_selection(selected_paths)
       end
     end
   end
+  -- Reset browse directory after successful selection
+  self._browse_dir = nil
   self:emit("update")
 end
 
@@ -211,7 +227,9 @@ end
 function FileSelector:open() self:show_selector_ui() end
 
 function FileSelector:get_filepaths()
-  if type(Config.file_selector.provider_opts.get_filepaths) == "function" then
+  local browse_dir = self._browse_dir
+
+  if not browse_dir and type(Config.file_selector.provider_opts.get_filepaths) == "function" then
     ---@type avante.file_selector.opts.IGetFilepathsParams
     local params = {
       cwd = Utils.get_project_root(),
@@ -225,8 +243,22 @@ function FileSelector:get_filepaths()
     selected_filepaths_set[abs_path] = true
   end
 
-  local project_root = Utils.get_project_root()
-  local file_info = get_project_filepaths(selected_filepaths_set)
+  local base_dir = browse_dir or Utils.get_project_root()
+  local file_info
+  if browse_dir then
+    -- Browsing outside project root — scan the browse directory directly
+    local files = Utils.scan_directory({ directory = browse_dir, add_dirs = true })
+    file_info = vim
+      .iter(files)
+      :filter(function(path) return not selected_filepaths_set[path] end)
+      :map(function(path)
+        local is_dir = vim.fn.isdirectory(path) == 1
+        return { path = path, is_dir = is_dir }
+      end)
+      :totable()
+  else
+    file_info = get_project_filepaths(selected_filepaths_set)
+  end
 
   table.sort(file_info, function(a, b)
     -- Sort alphabetically with directories being first
@@ -242,15 +274,15 @@ function FileSelector:get_filepaths()
   local filepaths = vim
     .iter(file_info)
     :map(function(info)
-      local rel_path = Utils.make_relative_path(info.path, project_root)
+      local rel_path = Utils.make_relative_path(info.path, base_dir)
       if info.is_dir then rel_path = rel_path .. "/" end
       return rel_path
     end)
     :totable()
-  
+
   -- Add "../" option at the beginning to allow navigating to parent directory
   table.insert(filepaths, 1, "../ (parent directory)")
-  
+
   return filepaths
 end
 

@@ -266,7 +266,7 @@ function M.select_history()
       Path.history.save_latest_filename(buf, filename)
       local sidebar = require("avante").get()
       sidebar:update_content_with_history()
-      sidebar:create_todos_container()
+      sidebar:create_plan_container()
       sidebar:initialize_token_count()
       vim.schedule(function() sidebar:focus_input() end)
     end)
@@ -277,23 +277,25 @@ function M.select_prompt()
   require("avante.prompt_selector").open()
 end
 
-function M.view_threads()
-  local buf = vim.api.nvim_get_current_buf()
-  require("avante.thread_viewer").open(buf, function(filename, external_session_id)
+---Shared callback factory for thread viewer pickers
+---@param buf integer
+---@return fun(filename: string, external_session_id?: string)
+local function make_thread_open_callback(buf)
+  return function(filename, external_session_id)
     vim.api.nvim_buf_call(buf, function()
       if not require("avante").is_sidebar_open() then require("avante").open_sidebar({}) end
       local Path = require("avante.path")
       local Utils = require("avante.utils")
-      
+
       -- Handle external ACP sessions (sessions created outside Avante)
       if external_session_id then
         -- Create a new Avante history for this external session
         local sidebar = require("avante").get()
         sidebar:reload_chat_history() -- This will create a new history if none exists
-        
+
         -- Set the ACP session ID to link it with the external session
         sidebar.chat_history.acp_session_id = external_session_id
-        
+
         -- Get the working directory from the external session info
         local thread_viewer = require("avante.thread_viewer")
         local external_info = thread_viewer.get_external_session_info(external_session_id)
@@ -304,59 +306,63 @@ function M.view_threads()
             Utils.info("Changed directory to: " .. external_info.working_directory)
           end
         end
-        
+
         -- Save the history with the ACP session ID
         Path.history.save(buf, sidebar.chat_history)
         Path.history.save_latest_filename(buf, sidebar.chat_history.filename)
-        
+
         -- Load the external session to sync its state
         local Config = require("avante.config")
         if Config.acp_providers[Config.provider] then
           Utils.info("Loading external ACP session...")
-          
+
           sidebar.acp_client = nil -- Force reconnection
           sidebar._on_session_load_complete = function()
             sidebar:reload_chat_history()
             sidebar:update_content_with_history()
-            sidebar:create_todos_container()
+            sidebar:create_plan_container()
             sidebar:initialize_token_count()
+            -- Update last_seen_message_count to clear unread indicator
+            if sidebar.chat_history then
+              sidebar.chat_history.last_seen_message_count = #(sidebar.chat_history.messages or {})
+              Path.history.save(buf, sidebar.chat_history)
+            end
             vim.schedule(function() sidebar:focus_input() end)
             sidebar._on_session_load_complete = nil
           end
-          
+
           vim.schedule(function()
             sidebar._load_existing_session = true
             sidebar:handle_submit("")
           end)
         else
           sidebar:update_content_with_history()
-          sidebar:create_todos_container()
+          sidebar:create_plan_container()
           sidebar:initialize_token_count()
           vim.schedule(function() sidebar:focus_input() end)
         end
-        
+
         return
       end
-      
+
       -- Handle regular Avante history
       Path.history.save_latest_filename(buf, filename)
       local sidebar = require("avante").get()
-      
+
       -- Reload chat history to get the latest state from disk
       sidebar:reload_chat_history()
-      
+
       -- If there's an ACP session, sync it with external changes
       local history = sidebar.chat_history
       if history and history.acp_session_id then
-        local Utils = require("avante.utils")
         local Config = require("avante.config")
-        
+
         -- Change to the working directory of the thread FIRST
         if history.working_directory and vim.fn.isdirectory(history.working_directory) == 1 then
           vim.cmd("cd " .. vim.fn.fnameescape(history.working_directory))
           Utils.info("Changed directory to: " .. history.working_directory)
         end
-        
+
         -- Restore selected files from history
         if history.selected_files and sidebar.file_selector then
           -- Clear existing selected files
@@ -366,28 +372,33 @@ function M.view_threads()
             sidebar.file_selector:add_selected_file(filepath)
           end
         end
-        
+
         -- Load the ACP session to sync state from external changes
         if Config.acp_providers[Config.provider] then
           Utils.info("Loading ACP session to sync external changes...")
-          
+
           -- Force reconnection and session loading
           sidebar.acp_client = nil -- Clear existing client to force reconnection
-          
+
           -- Set callback to update UI after session load completes
           sidebar._on_session_load_complete = function()
             -- Reload history to pick up any changes synced from ACP
             sidebar:reload_chat_history()
             sidebar:update_content_with_history()
-            sidebar:create_todos_container()
+            sidebar:create_plan_container()
             sidebar:initialize_token_count()
-            vim.schedule(function() 
+            -- Update last_seen_message_count to clear unread indicator
+            if sidebar.chat_history then
+              sidebar.chat_history.last_seen_message_count = #(sidebar.chat_history.messages or {})
+              Path.history.save(buf, sidebar.chat_history)
+            end
+            vim.schedule(function()
               sidebar:focus_input()
             end)
             -- Clear the callback
             sidebar._on_session_load_complete = nil
           end
-          
+
           -- Trigger a new connection with session loading
           vim.schedule(function()
             sidebar._load_existing_session = true
@@ -396,19 +407,218 @@ function M.view_threads()
         else
           -- For non-ACP providers, just update the content
           sidebar:update_content_with_history()
-          sidebar:create_todos_container()
+          sidebar:create_plan_container()
           sidebar:initialize_token_count()
           vim.schedule(function() sidebar:focus_input() end)
         end
       else
         -- No ACP session, just update normally
+        -- Update last_seen_message_count for non-ACP histories too
+        if history then
+          history.last_seen_message_count = #(history.messages or {})
+          Path.history.save(buf, history)
+        end
         sidebar:update_content_with_history()
-        sidebar:create_todos_container()
+        sidebar:create_plan_container()
         sidebar:initialize_token_count()
         vim.schedule(function() sidebar:focus_input() end)
       end
     end)
-  end)
+  end
+end
+
+function M.view_threads()
+  local buf = vim.api.nvim_get_current_buf()
+  require("avante.thread_viewer").open(buf, make_thread_open_callback(buf))
+end
+
+function M.view_pinned_threads()
+  local buf = vim.api.nvim_get_current_buf()
+  require("avante.thread_viewer").open(buf, make_thread_open_callback(buf), { filter = "pinned", show_unread = true })
+end
+
+--- Open sidebar with a new chat in a specific directory
+---@param dir string Absolute path to cd into
+---@param title string|nil Optional thread title
+local function open_new_chat_in_dir(dir, title)
+  local Utils = require("avante.utils")
+  local Path = require("avante.path")
+
+  vim.cmd("cd " .. vim.fn.fnameescape(dir))
+  Utils.info("Changed directory to: " .. dir)
+
+  require("avante").open_sidebar({})
+  local sidebar = require("avante").get()
+  if sidebar then
+    sidebar:new_chat()
+    if title and sidebar.chat_history then
+      sidebar.chat_history.title = title
+      Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
+      sidebar:show_input_hint()
+    end
+  end
+end
+
+--- Create a git worktree and start a new chat in it
+---@param worktree_name string
+function M.new_worktree_chat(worktree_name)
+  local Utils = require("avante.utils")
+  local Config = require("avante.config")
+
+  local git_root = Utils.root.git()
+
+  -- Validate we're in a git repo
+  local check = vim.system({ "git", "-C", git_root, "rev-parse", "--git-dir" }, { text = true }):wait()
+  if check.code ~= 0 then
+    Utils.error("Not in a git repository")
+    return
+  end
+
+  -- Determine worktree target path
+  local worktrees_root = Config.behaviour and Config.behaviour.worktrees_root
+  local base_dir = worktrees_root and vim.fn.expand(worktrees_root) or vim.fn.fnamemodify(git_root, ":h")
+  local worktree_path = base_dir .. "/" .. worktree_name
+
+  -- Prune stale worktrees before creating a new one
+  vim.system({ "git", "-C", git_root, "worktree", "prune" }, { text = true }):wait()
+
+  -- Create the worktree
+  Utils.info("Creating worktree: " .. worktree_path)
+  local result = vim.system(
+    { "git", "-C", git_root, "worktree", "add", worktree_path, "-b", worktree_name },
+    { text = true }
+  ):wait()
+
+  if result.code ~= 0 then
+    Utils.error("Failed to create worktree: " .. (result.stderr or "unknown error"))
+    return
+  end
+
+  open_new_chat_in_dir(worktree_path, worktree_name)
+end
+
+--- List existing git worktrees (excluding the main worktree)
+---@return {name: string, path: string}[]
+local function list_worktrees()
+  local Utils = require("avante.utils")
+  local git_root = Utils.root.git()
+  local result = vim.system({ "git", "-C", git_root, "worktree", "list", "--porcelain" }, { text = true }):wait()
+  if result.code ~= 0 then return {} end
+
+  local worktrees = {}
+  local current_path = nil
+  for line in result.stdout:gmatch("[^\n]+") do
+    if line:match("^worktree ") then
+      current_path = line:sub(10)
+    elseif line:match("^branch ") and current_path then
+      -- Skip the main worktree (same as git root)
+      if current_path ~= git_root then
+        local name = vim.fn.fnamemodify(current_path, ":t")
+        table.insert(worktrees, { name = name, path = current_path })
+      end
+      current_path = nil
+    end
+  end
+  return worktrees
+end
+
+--- Show a telescope picker for creating a new chat: current dir, existing worktrees, or create new
+---@param ask_args table|nil Arguments to pass through to api.ask for "use current" path
+function M.new_chat_picker(ask_args)
+  local Utils = require("avante.utils")
+  local Config = require("avante.config")
+
+  local worktrees_root = Config.behaviour and Config.behaviour.worktrees_root
+  if not worktrees_root then
+    -- No worktrees configured, just do a normal new chat
+    ask_args = ask_args or {}
+    ask_args.ask = false
+    ask_args.new_chat = true
+    M.ask(ask_args)
+    return
+  end
+
+  local ok, telescope = pcall(require, "telescope.pickers")
+  if not ok then
+    -- No telescope, fall back to normal new chat
+    ask_args = ask_args or {}
+    ask_args.ask = false
+    ask_args.new_chat = true
+    M.ask(ask_args)
+    return
+  end
+
+  local finders = require("telescope.finders")
+  local conf = require("telescope.config").values
+  local actions = require("telescope.actions")
+  local action_state = require("telescope.actions.state")
+
+  -- Build entries
+  local entries = {}
+
+  -- "Use current directory" option
+  table.insert(entries, {
+    display = "[*] Use current directory (" .. vim.fn.fnamemodify(vim.fn.getcwd(), ":~") .. ")",
+    ordinal = "use current directory",
+    action = "current",
+  })
+
+  -- Existing worktrees
+  local worktrees = list_worktrees()
+  for _, wt in ipairs(worktrees) do
+    table.insert(entries, {
+      display = "    " .. wt.name .. " (" .. vim.fn.fnamemodify(wt.path, ":~") .. ")",
+      ordinal = wt.name .. " " .. wt.path,
+      action = "select",
+      worktree = wt,
+    })
+  end
+
+  -- "Create new worktree" option
+  table.insert(entries, {
+    display = "[+] Create new worktree",
+    ordinal = "create new worktree",
+    action = "create",
+  })
+
+  telescope.new({}, {
+    prompt_title = "New Chat",
+    finder = finders.new_table({
+      results = entries,
+      entry_maker = function(entry)
+        return {
+          value = entry,
+          display = entry.display,
+          ordinal = entry.ordinal,
+        }
+      end,
+    }),
+    sorter = conf.generic_sorter({}),
+    attach_mappings = function(prompt_bufnr, _)
+      actions.select_default:replace(function()
+        local selection = action_state.get_selected_entry()
+        actions.close(prompt_bufnr)
+        if not selection then return end
+
+        local entry = selection.value
+        if entry.action == "current" then
+          local args = ask_args or {}
+          args.ask = false
+          args.new_chat = true
+          M.ask(args)
+        elseif entry.action == "select" then
+          open_new_chat_in_dir(entry.worktree.path, entry.worktree.name)
+        elseif entry.action == "create" then
+          vim.ui.input({ prompt = "Worktree name: " }, function(input)
+            if input and input ~= "" then
+              M.new_worktree_chat(vim.trim(input))
+            end
+          end)
+        end
+      end)
+      return true
+    end,
+  }):find()
 end
 
 --- Request agent to enter plan mode (for ACP agents like claude-code)

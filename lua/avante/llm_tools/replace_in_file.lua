@@ -188,6 +188,9 @@ Please make sure the diff is formatted correctly, and that the SEARCH/REPLACE bl
 
   session_ctx.prev_streaming_diff_timestamp_map[opts.tool_use_id] = current_timestamp
 
+  -- Snapshot file before first edit for review
+  Helpers.snapshot_file_for_review(abs_path, session_ctx)
+
   local bufnr, err = Helpers.get_bufnr(abs_path)
   if err then return false, err end
 
@@ -455,7 +458,10 @@ Please make sure the diff is formatted correctly, and that the SEARCH/REPLACE bl
           on_complete(false, "User canceled")
           return
         end
-        if session_ctx then Helpers.mark_as_not_viewed(input.path, session_ctx) end
+        if session_ctx then
+          Helpers.mark_as_not_viewed(input.path, session_ctx)
+          Helpers.track_edited_file(abs_path, session_ctx, M.name)
+        end
         on_complete(true, nil)
       end,
     })
@@ -734,7 +740,10 @@ Please make sure the diff is formatted correctly, and that the SEARCH/REPLACE bl
       return
     end
     vim.api.nvim_buf_call(bufnr, function() vim.cmd("noautocmd write!") end)
-    if session_ctx then Helpers.mark_as_not_viewed(input.path, session_ctx) end
+    if session_ctx then
+      Helpers.mark_as_not_viewed(input.path, session_ctx)
+      Helpers.track_edited_file(abs_path, session_ctx, M.name)
+    end
     on_complete(true, nil)
   end, { focus = not Config.behaviour.auto_focus_on_diff_view }, session_ctx, M.name)
 end

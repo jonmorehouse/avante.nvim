@@ -71,6 +71,7 @@ function M.func(input, opts)
   if input.insert_line == nil then return false, "insert_line not provided" end
   if input.new_str == nil then return false, "new_str not provided" end
   local ns_id = vim.api.nvim_create_namespace("avante_insert_diff")
+  Helpers.snapshot_file_for_review(abs_path, session_ctx)
   local bufnr, err = Helpers.get_bufnr(abs_path)
   if err then return false, err end
   local function clear_highlights() vim.api.nvim_buf_clear_namespace(bufnr, ns_id, 0, -1) end
@@ -99,7 +100,10 @@ function M.func(input, opts)
     end
     vim.api.nvim_buf_set_lines(bufnr, input.insert_line, input.insert_line, false, new_lines)
     vim.api.nvim_buf_call(bufnr, function() vim.cmd("noautocmd write") end)
-    if session_ctx then Helpers.mark_as_not_viewed(input.path, session_ctx) end
+    if session_ctx then
+      Helpers.mark_as_not_viewed(input.path, session_ctx)
+      Helpers.track_edited_file(abs_path, session_ctx, M.name)
+    end
     on_complete(true, nil)
   end, { focus = true }, session_ctx, M.name)
 end

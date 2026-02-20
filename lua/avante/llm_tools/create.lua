@@ -83,6 +83,7 @@ function M.func(input, opts)
     vim.api.nvim_set_current_win(winid)
     vim.cmd("noautocmd write")
     vim.api.nvim_set_current_win(current_winid)
+    if session_ctx then Helpers.track_edited_file(abs_path, session_ctx, M.name) end
     on_complete(true, nil)
   end, { focus = true }, session_ctx, M.name)
 end

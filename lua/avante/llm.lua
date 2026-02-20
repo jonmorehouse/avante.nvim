@@ -555,6 +555,31 @@ function M.generate_prompts(opts)
   }
 end
 
+---Extract task summary from message history
+---@param messages table[]
+---@return string
+function M._extract_task_summary(messages)
+  if not messages or #messages == 0 then return "Agent task" end
+  
+  -- Find most recent user message
+  for i = #messages, 1, -1 do
+    local msg = messages[i]
+    if msg.role == "user" and msg.content then
+      local content = msg.content
+      -- Remove <task> tags if present
+      content = content:gsub("<task>", ""):gsub("</task>", "")
+      -- Return first N characters
+      local max_len = Config.notifications.max_summary_length
+      if #content > max_len then
+        return content:sub(1, max_len) .. "..."
+      end
+      return content
+    end
+  end
+  
+  return "Agent task"
+end
+
 ---@param opts AvanteGeneratePromptsOptions
 ---@return integer
 function M.calculate_tokens(opts)
@@ -1001,6 +1026,8 @@ function M._stream_acp(opts)
   Utils.debug("use ACP", Config.provider)
   ---@type table<string, avante.HistoryMessage>
   local tool_call_messages = {}
+  ---@type table<string, string> Maps toolCallId to the user's selected answer text
+  local permission_answers = {}
   ---@type avante.HistoryMessage
   local last_tool_call_message = nil
   local acp_provider = Config.acp_providers[Config.provider]
@@ -1075,6 +1102,12 @@ function M._stream_acp(opts)
             -- Store plan entries in session state
             session_state.last_plan_entries = update.entries or {}
             Utils.debug("Plan update received with " .. #(update.entries or {}) .. " entries")
+
+            -- Push plan entries through AcpThread if available (syncs plan_entries and fires callbacks)
+            local sidebar = require("avante").get()
+            if sidebar and sidebar.acp_thread then
+              sidebar.acp_thread.plan_entries = update.entries or {}
+            end
 
             local todos = {}
             for idx, entry in ipairs(update.entries or {}) do
@@ -1186,6 +1219,20 @@ function M._stream_acp(opts)
               end)
             end
 
+            -- Intercept TodoWrite tool calls to populate the plan container
+            if tool_title:match("TodoWrite") or tool_title:match("write_todos") then
+              local raw = update.rawInput or {}
+              local todos_input = raw.todos
+              if todos_input and type(todos_input) == "table" and #todos_input > 0 then
+                vim.schedule(function()
+                  local sidebar = require("avante").get()
+                  if sidebar and sidebar.acp_thread then
+                    sidebar.acp_thread:_update_todos_from_tool(todos_input)
+                  end
+                end)
+              end
+            end
+
             local sidebar = require("avante").get()
 
             if
@@ -1260,7 +1307,7 @@ function M._stream_acp(opts)
               tool_call_message = History.Message:new("assistant", {
                 type = "tool_use",
                 id = update.toolCallId,
-                name = "",
+                name = update.kind or update.title or "",
               })
               tool_call_messages[update.toolCallId] = tool_call_message
               tool_call_message.acp_tool_call = update
@@ -1278,10 +1325,13 @@ function M._stream_acp(opts)
             elseif update.status == "completed" or update.status == "failed" then
               tool_call_message.is_calling = false
               tool_call_message.state = "generated"
+              -- Use stored permission answer if available (e.g., "Yes, and auto-accept edits")
+              local answer_content = permission_answers[update.toolCallId]
+              permission_answers[update.toolCallId] = nil
               tool_result_message = History.Message:new("assistant", {
                 type = "tool_result",
                 tool_use_id = update.toolCallId,
-                content = nil,
+                content = answer_content,
                 is_error = update.status == "failed",
                 is_user_declined = update.status == "cancelled",
               })
@@ -1301,6 +1351,9 @@ function M._stream_acp(opts)
                 local exists = false
                 for _, command_ in ipairs(Config.slash_commands) do
                   if command_.name == command.name then
+                    command_.source = "acp"
+                    command_.description = command.description
+                    command_.details = command.description
                     exists = true
                     break
                   end
@@ -1310,6 +1363,7 @@ function M._stream_acp(opts)
                     name = command.name,
                     description = command.description,
                     details = command.description,
+                    source = "acp",
                   })
                 end
               end
@@ -1352,6 +1406,7 @@ function M._stream_acp(opts)
             -- Auto-reject in plan mode
             Utils.warn("Plan mode: " .. (rejection_reason or "Tool not allowed"))
             local acp_mapped_options = ACPConfirmAdapter.map_acp_options(options)
+            permission_answers[tool_call.toolCallId] = "Rejected (plan mode)"
             if acp_mapped_options.no then
               callback(acp_mapped_options.no)
             else
@@ -1369,18 +1424,53 @@ function M._stream_acp(opts)
             return
           end
 
+          -- Auto-approve plan mode transitions — these are state signals, not dangerous actions
+          local tool_title_for_approval = tool_call.title or ""
+          if tool_title_for_approval:match("ExitPlanMode") or tool_title_for_approval:match("EnterPlanMode") then
+            local acp_mapped_options = ACPConfirmAdapter.map_acp_options(options)
+            permission_answers[tool_call.toolCallId] = "Auto-approved"
+            callback(acp_mapped_options.yes or acp_mapped_options.all)
+            sidebar.scroll = true
+            sidebar._history_cache_invalidated = true
+            sidebar:update_content("")
+            return
+          end
+
+          -- Surface question text for AskUserQuestion tool calls
+          local is_ask_question = tool_call.title and tool_call.title:match("AskUserQuestion")
+          if is_ask_question and tool_call.rawInput then
+            local q_text = tool_call.rawInput.question or tool_call.rawInput.text
+            if q_text then
+              sidebar.permission_question_text = q_text
+            end
+          end
+
           local description = HistoryRender.get_tool_display_name(message)
-          LLMToolHelpers.confirm(description, function(ok)
+          LLMToolHelpers.confirm(description, function(ok, selected_option_id)
             local acp_mapped_options = ACPConfirmAdapter.map_acp_options(options)
 
+            local chosen_option_id
             if ok and opts.session_ctx and opts.session_ctx.always_yes then
-              callback(acp_mapped_options.all)
+              chosen_option_id = acp_mapped_options.all or acp_mapped_options.yes
             elseif ok then
-              callback(acp_mapped_options.yes)
+              chosen_option_id = acp_mapped_options.yes or acp_mapped_options.all
             else
-              callback(acp_mapped_options.no)
+              chosen_option_id = selected_option_id or acp_mapped_options.no
             end
 
+            -- Store the selected option name for rendering in the tool result
+            if chosen_option_id then
+              for _, opt in ipairs(options) do
+                if opt.optionId == chosen_option_id then
+                  permission_answers[tool_call.toolCallId] = opt.name
+                  break
+                end
+              end
+            end
+
+            callback(chosen_option_id)
+
+            sidebar.permission_question_text = nil
             sidebar.scroll = true
             sidebar._history_cache_invalidated = true
             sidebar:update_content("")
@@ -1830,28 +1920,32 @@ function M._continue_stream_acp(opts, acp_client, session_id)
     end
   else
     if donot_use_builtin_system_prompt then
-      -- Include all user messages for better context preservation
+      -- Include both user and assistant messages for full context preservation
+      -- This is critical for forked threads where the new ACP session needs
+      -- the complete conversation history (not just user messages)
       for _, message in ipairs(history_messages) do
-        if message.message.role == "user" then
+        local role = message.message.role
+        if role == "user" or role == "assistant" then
+          local role_tag = role == "user" and "previous_user_message" or "previous_assistant_message"
           local content = message.message.content
           if type(content) == "table" then
             for _, item in ipairs(content) do
               if type(item) == "string" then
                 table.insert(prompt, {
                   type = "text",
-                  text = item,
+                  text = "<" .. role_tag .. ">" .. item .. "</" .. role_tag .. ">",
                 })
               elseif type(item) == "table" and item.type == "text" then
                 table.insert(prompt, {
                   type = "text",
-                  text = item.text,
+                  text = "<" .. role_tag .. ">" .. (item.text or item.content or "") .. "</" .. role_tag .. ">",
                 })
               end
             end
-          else
+          elseif type(content) == "string" then
             table.insert(prompt, {
               type = "text",
-              text = content,
+              text = "<" .. role_tag .. ">" .. content .. "</" .. role_tag .. ">",
             })
           end
         end
@@ -1895,6 +1989,15 @@ function M._continue_stream_acp(opts, acp_client, session_id)
       end
       acp_client:cancel_session(session_id)
       opts.on_stop({ reason = "cancelled" })
+      
+      -- Send cancellation notification
+      if Config.notifications.enabled and Config.notifications.notify_on_cancel then
+        local ok, Notifications = pcall(require, "avante.notifications")
+        if ok then
+          local task_summary = M._extract_task_summary(opts.messages or opts.history_messages or {})
+          Notifications.on_agent_complete(session_id, { reason = "cancelled" }, task_summary)
+        end
+      end
     end,
   })
   
@@ -1905,6 +2008,14 @@ function M._continue_stream_acp(opts, acp_client, session_id)
     current_mode_id = sidebar.current_mode_id
     if current_mode_id then
       Utils.debug("Including mode in prompt: " .. current_mode_id)
+    end
+  end
+  
+  -- Track agent start for notifications
+  if Config.notifications.enabled then
+    local ok, Notifications = pcall(require, "avante.notifications")
+    if ok then
+      Notifications.on_agent_start(session_id)
     end
   end
   
@@ -2035,9 +2146,28 @@ function M._continue_stream_acp(opts, acp_client, session_id)
         return
       end
       opts.on_stop({ reason = "error", error = err_ })
+      
+      -- Send error notification
+      if Config.notifications.enabled and Config.notifications.notify_on_error then
+        local ok, Notifications = pcall(require, "avante.notifications")
+        if ok then
+          local task_summary = M._extract_task_summary(opts.messages or opts.history_messages or {})
+          Notifications.on_agent_complete(session_id, { reason = "error", error = err_ }, task_summary)
+        end
+      end
+      
       return
     end
     opts.on_stop({ reason = "complete" })
+    
+    -- Send completion notification
+    if Config.notifications.enabled and Config.notifications.notify_on_complete then
+      local ok, Notifications = pcall(require, "avante.notifications")
+      if ok then
+        local task_summary = M._extract_task_summary(opts.messages or opts.history_messages or {})
+        Notifications.on_agent_complete(session_id, { reason = "complete" }, task_summary)
+      end
+    end
   end)
 end
 

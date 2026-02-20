@@ -31,6 +31,12 @@ M._defaults = {
   ---@alias avante.Mode "agentic" | "legacy"
   ---@type avante.Mode
   mode = "agentic",
+  --- ACP backend implementation to use.
+  --- "lua" uses the built-in Lua JSON-RPC client.
+  --- "rust" uses the native Rust ACP SDK (requires avante-acp native module).
+  ---@alias avante.AcpBackend "lua" | "rust"
+  ---@type avante.AcpBackend
+  acp_backend = "lua",
   ---@alias avante.ProviderName "claude" | "openai" | "azure" | "gemini" | "vertex" | "cohere" | "copilot" | "bedrock" | "ollama" | "watsonx_code_assistant" | string
   ---@type avante.ProviderName
   provider = "claude",
@@ -567,7 +573,11 @@ M._defaults = {
     acp_default_mode = nil,
     --- Whether to prompt before exiting when there are active ACP sessions
     ---@type boolean
-    prompt_on_exit_with_active_session = true,
+    prompt_on_exit_with_active_session = false,
+    --- Base directory for git worktrees created by :AvanteChatNewWorktree
+    --- Set to a path like "~/worktrees" or nil to use the parent of the git root
+    ---@type string|nil
+    worktrees_root = nil,
     --- Status line configuration for input container
     ---@type table
     status_line = {
@@ -578,8 +588,19 @@ M._defaults = {
       show_tokens = true, -- Show token count
       show_submit_key = true, -- Show submit keybinding
       show_session_info = true, -- Show session mode and ID
+      show_working_directory = true, -- Show the chat's working directory
       format = nil, -- Custom format string: "{plan_mode} | {following_status} | {tokens} | {submit_key}"
     },
+  },
+  notifications = { -- Desktop notifications for agent completion
+    enabled = true, -- Master toggle for all notifications
+    notify_on_complete = true, -- Notify when agent completes successfully
+    notify_on_error = true, -- Notify when agent encounters an error
+    notify_on_cancel = false, -- Notify when agent is cancelled (opt-in)
+    include_duration = true, -- Show task duration in notification
+    include_summary = true, -- Show brief task description
+    max_summary_length = 50, -- Character limit for task summary
+    sound = true, -- Enable notification sound (platform-dependent)
   },
   prompt_logger = { -- logs prompts to disk with rich metadata (per-project, searchable via telescope)
     enabled = true, -- toggle logging entirely
@@ -685,6 +706,7 @@ M._defaults = {
       switch_windows = "<Tab>",
       reverse_switch_windows = "<C-S-Tab>",
       toggle_code_window = "x",
+      toggle_plan = "<D-t>",
       toggle_fullscreen_edit = "<S-f>",
       toggle_input_fullscreen = "<C-f>",
       remove_file = "d",
