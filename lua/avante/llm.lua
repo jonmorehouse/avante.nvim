@@ -1443,9 +1443,9 @@ function M._stream_acp(opts)
             local acp_mapped_options = ACPConfirmAdapter.map_acp_options(options)
 
             if ok and opts.session_ctx and opts.session_ctx.always_yes then
-              callback(acp_mapped_options.all)
+              callback(acp_mapped_options.all or acp_mapped_options.yes)
             elseif ok then
-              callback(acp_mapped_options.yes)
+              callback(acp_mapped_options.yes or acp_mapped_options.all)
             else
               callback(acp_mapped_options.no)
             end

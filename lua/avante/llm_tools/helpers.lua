@@ -77,9 +77,18 @@ function M.confirm(message, callback, confirm_opts, session_ctx, tool_name)
 
   if Config.behaviour.confirmation_ui_style == "inline_buttons" then
     M.confirm_inline(function(option_id)
-      if option_id == "allow" or option_id == "allow_once" or option_id == "allow_always" then
-        if option_id == "allow_always" and session_ctx then session_ctx.always_yes = true end
+      -- Look up the kind for this optionId from the permission options
+      local kind = nil
+      local perm_options = (confirm_opts and confirm_opts.permission_options) or {}
+      for _, opt in ipairs(perm_options) do
+        if opt.optionId == option_id then
+          kind = opt.kind
+          break
+        end
+      end
 
+      if kind == "allow_once" or kind == "allow_always" then
+        if kind == "allow_always" and session_ctx then session_ctx.always_yes = true end
         callback(true)
       else
         callback(false, option_id)

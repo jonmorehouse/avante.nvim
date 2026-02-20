@@ -1715,6 +1715,7 @@ function M.get_commands()
       name = "prompt"
     },
     { description = "Fork the current thread", name = "fork" },
+    { description = "Show files changed in this session", name = "files" },
   }
 
   ---@type {[AvanteSlashCommandBuiltInName]: AvanteSlashCommandCallback}
@@ -2077,6 +2078,10 @@ Use `/compact` to update the memory with recent messages.]],
     end,
     fork = function(sidebar, args, cb)
       sidebar:fork_thread()
+      if cb then cb(args) end
+    end,
+    files = function(sidebar, args, cb)
+      require("avante.changed_files").open()
       if cb then cb(args) end
     end,
   }
