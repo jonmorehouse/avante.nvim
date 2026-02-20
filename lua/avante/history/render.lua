@@ -129,6 +129,107 @@ local STATE_TO_HL = {
   succeeded = "AvanteStateSpinnerSucceeded",
 }
 
+--- Emoji + short verb for each tool type (used in compact collapsed view)
+local TOOL_ICONS = {
+  -- Reading / searching
+  Read            = { icon = "📖", verb = "read" },
+  view            = { icon = "📖", verb = "read" },
+  -- Editing / writing
+  Edit            = { icon = "✏️",  verb = "edited" },
+  Write           = { icon = "📝", verb = "wrote" },
+  Create          = { icon = "📝", verb = "created" },
+  str_replace     = { icon = "✏️",  verb = "edited" },
+  replace_in_file = { icon = "✏️",  verb = "edited" },
+  edit_file       = { icon = "✏️",  verb = "edited" },
+  insert          = { icon = "✏️",  verb = "inserted into" },
+  create          = { icon = "📝", verb = "created" },
+  write_to_file   = { icon = "📝", verb = "wrote" },
+  -- Search
+  Grep            = { icon = "🔍", verb = "searched" },
+  grep            = { icon = "🔍", verb = "searched" },
+  Glob            = { icon = "🔍", verb = "found files" },
+  glob            = { icon = "🔍", verb = "found files" },
+  -- Shell / execution
+  Bash            = { icon = "⚡", verb = "ran" },
+  bash            = { icon = "⚡", verb = "ran" },
+  execute         = { icon = "⚡", verb = "ran" },
+  -- Navigation / listing
+  ls              = { icon = "📂", verb = "listed" },
+  -- Thinking
+  think           = { icon = "🤔", verb = "thinking" },
+  Think           = { icon = "🤔", verb = "thinking" },
+  -- Questions
+  AskUserQuestion = { icon = "❓", verb = "asked" },
+  -- Task management
+  TodoWrite       = { icon = "📋", verb = "updated plan" },
+  write_todos     = { icon = "📋", verb = "updated plan" },
+  read_todos      = { icon = "📋", verb = "read plan" },
+  -- Completion
+  attempt_completion = { icon = "✅", verb = "completed" },
+  -- Sub-agents
+  dispatch_agent  = { icon = "🔄", verb = "dispatched" },
+  Task            = { icon = "🔄", verb = "launched agent" },
+  -- Web
+  WebFetch        = { icon = "🌐", verb = "fetched" },
+  WebSearch       = { icon = "🌐", verb = "searched web" },
+  -- Notebook
+  NotebookEdit    = { icon = "📓", verb = "edited notebook" },
+  -- Plan mode transitions
+  EnterPlanMode   = { icon = "🗺️",  verb = "entered plan mode" },
+  ExitPlanMode    = { icon = "🗺️",  verb = "exited plan mode" },
+}
+
+--- Get the compact description for a tool call (emoji + verb + param)
+---@param tool_name string  The raw tool name (e.g., "Read", "Edit", "Bash")
+---@param item table  The tool_use content item
+---@param message table  The history message
+---@return string icon, string description
+local function get_tool_compact_info(tool_name, item, message)
+  local info = TOOL_ICONS[tool_name]
+  local icon = info and info.icon or "🔧"
+  local verb = info and info.verb or tool_name:lower()
+
+  -- Extract the most relevant parameter for a short description
+  local param
+  if item.input and type(item.input) == "table" then
+    local path = item.input.path or item.input.rel_path or item.input.filepath or item.input.file_path
+    if type(path) == "string" then
+      param = Utils.relative_path(path)
+    elseif type(item.input.query) == "string" then
+      param = item.input.query
+    elseif type(item.input.pattern) == "string" then
+      param = item.input.pattern
+    elseif type(item.input.command) == "string" then
+      param = vim.split(item.input.command, "\n")[1]
+      if #param > 50 then param = param:sub(1, 47) .. "..." end
+    end
+  end
+  -- Try ACP locations
+  if not param and message.acp_tool_call then
+    if message.acp_tool_call.locations then
+      for _, loc in ipairs(message.acp_tool_call.locations) do
+        if loc.path then
+          param = Utils.relative_path(loc.path)
+          break
+        end
+      end
+    end
+    if not param and message.acp_tool_call.rawInput then
+      local ri = message.acp_tool_call.rawInput
+      local path = ri.path or ri.rel_path or ri.filepath or ri.file_path
+      if type(path) == "string" then
+        param = Utils.relative_path(path)
+      elseif type(ri.command) == "string" then
+        param = vim.split(ri.command, "\n")[1]
+        if #param > 50 then param = param:sub(1, 47) .. "..." end
+      end
+    end
+  end
+
+  local desc = param and (verb .. " " .. param) or verb
+  return icon, desc
+end
+
 function M.get_diff_lines(old_str, new_str, decoration, truncate)
   local lines = {}
   local line_count = 0
@@ -434,7 +535,20 @@ local function tool_to_lines(item, message, messages, expanded)
     state = "succeeded"
   end
 
-  -- Collapsed single-line view for completed/failed tool calls
+  -- Get the raw tool name for icon lookup (before param decoration)
+  local raw_tool_name = item.name or ""
+  if message.acp_tool_call and message.acp_tool_call.title then
+    raw_tool_name = message.acp_tool_call.title
+  end
+
+  -- Plan mode transitions are always "succeeded" — the agent reports them as
+  -- "failed" because ExitPlanMode waits for user approval, but from the user's
+  -- perspective these are normal state transitions, not failures.
+  if raw_tool_name:match("ExitPlanMode") or raw_tool_name:match("EnterPlanMode") then
+    if state == "failed" then state = "succeeded" end
+  end
+
+  -- Compact single-line view for completed/failed tool calls (collapsed)
   if not expanded and state ~= "generating" then
     -- Custom collapsed view for AskUserQuestion
     if item.name == "AskUserQuestion" then
@@ -456,13 +570,25 @@ local function tool_to_lines(item, message, messages, expanded)
       }
     end
 
-    local icon = state == "succeeded" and "✓" or "✗"
+    local icon, desc = get_tool_compact_info(raw_tool_name, item, message)
+    local state_icon = state == "succeeded" and " ✓" or " ✗"
     return {
       Line:new({
         { "▶ " },
         { icon .. " " },
-        { tool_name .. " ", STATE_TO_HL[state] },
-        { " " .. state, Highlights.AVANTE_COMMENT_FG },
+        { desc, STATE_TO_HL[state] },
+        { state_icon, Highlights.AVANTE_COMMENT_FG },
+      }),
+    }
+  end
+
+  -- Compact single-line view for in-progress tool calls (generating, not expanded)
+  if not expanded and state == "generating" then
+    local icon, desc = get_tool_compact_info(raw_tool_name, item, message)
+    return {
+      Line:new({
+        { icon .. " " },
+        { desc .. "...", STATE_TO_HL[state] },
       }),
     }
   end

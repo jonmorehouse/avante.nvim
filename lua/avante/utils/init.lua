@@ -1714,6 +1714,7 @@ function M.get_commands()
       description = "/prompt - Open telescope picker to select and reuse a prompt from history",
       name = "prompt"
     },
+    { description = "Fork the current thread", name = "fork" },
   }
 
   ---@type {[AvanteSlashCommandBuiltInName]: AvanteSlashCommandCallback}
@@ -1850,7 +1851,6 @@ Use `/compact` to update the memory with recent messages.]],
       if cb then cb(args) end
     end,
     plan = function(sidebar, args, cb)
-      -- Show the current plan from todos
       M.debug("/plan command called")
       -- Ensure chat history is loaded
       if not sidebar.chat_history then
@@ -1859,63 +1859,112 @@ Use `/compact` to update the memory with recent messages.]],
       end
 
       local history = sidebar.chat_history
-      M.debug("/plan: history=" .. tostring(history ~= nil) .. ", todos=" .. tostring(history and history.todos and #history.todos or 0))
-      if not history or not history.todos or #history.todos == 0 then
-        M.debug("/plan: no todos available, showing empty message")
-        sidebar:update_content("No plan available.\n\nTodos will appear here when you use plan mode or when the assistant creates a plan.", { focus = false, scroll = false })
+
+      -- First, try structured todos (from ACP plan_update notifications)
+      if history and history.todos and #history.todos > 0 then
+        local todos = history.todos
+        local plan_text = "**Current Plan**\n\n"
+
+        local pending_todos = {}
+        local in_progress_todos = {}
+        local completed_todos = {}
+
+        for _, todo in ipairs(todos) do
+          if todo.status == "pending" or todo.status == "todo" then
+            table.insert(pending_todos, todo)
+          elseif todo.status == "in_progress" or todo.status == "doing" then
+            table.insert(in_progress_todos, todo)
+          elseif todo.status == "completed" or todo.status == "done" then
+            table.insert(completed_todos, todo)
+          end
+        end
+
+        if #in_progress_todos > 0 then
+          plan_text = plan_text .. "**In Progress:**\n"
+          for _, todo in ipairs(in_progress_todos) do
+            plan_text = plan_text .. "- 🔄 " .. todo.content .. "\n"
+          end
+          plan_text = plan_text .. "\n"
+        end
+
+        if #pending_todos > 0 then
+          plan_text = plan_text .. "**Pending:**\n"
+          for _, todo in ipairs(pending_todos) do
+            plan_text = plan_text .. "- ⏳ " .. todo.content .. "\n"
+          end
+          plan_text = plan_text .. "\n"
+        end
+
+        if #completed_todos > 0 then
+          plan_text = plan_text .. "**Completed:**\n"
+          for _, todo in ipairs(completed_todos) do
+            plan_text = plan_text .. "- ✅ " .. todo.content .. "\n"
+          end
+          plan_text = plan_text .. "\n"
+        end
+
+        plan_text = plan_text .. string.format("\n**Progress:** %d/%d tasks completed", #completed_todos, #todos)
+        sidebar:update_content(plan_text, { focus = false, scroll = false })
         if cb then cb(args) end
         return
       end
-      
-      local todos = history.todos
-      local plan_text = "**Current Plan**\n\n"
-      
-      -- Group todos by status
-      local pending_todos = {}
-      local in_progress_todos = {}
-      local completed_todos = {}
-      
-      for _, todo in ipairs(todos) do
-        -- Handle both old status names (pending/in_progress/completed) and new ones (todo/doing/done)
-        if todo.status == "pending" or todo.status == "todo" then
-          table.insert(pending_todos, todo)
-        elseif todo.status == "in_progress" or todo.status == "doing" then
-          table.insert(in_progress_todos, todo)
-        elseif todo.status == "completed" or todo.status == "done" then
-          table.insert(completed_todos, todo)
+
+      -- Second, try to find a plan file from the conversation
+      -- Claude Code writes plans to ~/.claude/plans/*.md via the Write tool
+      local plan_file_path = nil
+      if history then
+        local History = require("avante.history")
+        local messages = History.get_history_messages(history)
+        if messages then
+          -- Scan messages in reverse to find the most recent plan file write
+          for i = #messages, 1, -1 do
+            local msg = messages[i]
+            local content = msg.message and msg.message.content
+            if type(content) == "table" then
+              for _, item in ipairs(content) do
+                if item.type == "tool_use" then
+                  local input = item.input or {}
+                  local path = input.file_path or input.path or ""
+                  if path:match("%.claude/plans/") and path:match("%.md$") then
+                    plan_file_path = path
+                    break
+                  end
+                end
+              end
+            end
+            -- Also check ACP tool call data
+            if not plan_file_path and msg.acp_tool_call then
+              local tc = msg.acp_tool_call
+              local title = tc.title or ""
+              if title:match("Write") or title:match("write") then
+                local raw = tc.rawInput or {}
+                local path = raw.file_path or raw.path or ""
+                if path:match("%.claude/plans/") and path:match("%.md$") then
+                  plan_file_path = path
+                end
+              end
+            end
+            if plan_file_path then break end
+          end
         end
       end
-      
-      -- Display in-progress todos
-      if #in_progress_todos > 0 then
-        plan_text = plan_text .. "**In Progress:**\n"
-        for _, todo in ipairs(in_progress_todos) do
-          plan_text = plan_text .. "- 🔄 " .. todo.content .. "\n"
+
+      if plan_file_path then
+        -- Expand ~ to home directory
+        local expanded = plan_file_path:gsub("^~", vim.fn.expand("~"))
+        expanded = vim.fn.fnamemodify(expanded, ":p")
+        local file = io.open(expanded, "r")
+        if file then
+          local content = file:read("*a")
+          file:close()
+          sidebar:update_content(content, { focus = false, scroll = false })
+          if cb then cb(args) end
+          return
         end
-        plan_text = plan_text .. "\n"
       end
-      
-      -- Display pending todos
-      if #pending_todos > 0 then
-        plan_text = plan_text .. "**Pending:**\n"
-        for _, todo in ipairs(pending_todos) do
-          plan_text = plan_text .. "- ⏳ " .. todo.content .. "\n"
-        end
-        plan_text = plan_text .. "\n"
-      end
-      
-      -- Display completed todos
-      if #completed_todos > 0 then
-        plan_text = plan_text .. "**Completed:**\n"
-        for _, todo in ipairs(completed_todos) do
-          plan_text = plan_text .. "- ✅ " .. todo.content .. "\n"
-        end
-        plan_text = plan_text .. "\n"
-      end
-      
-      plan_text = plan_text .. string.format("\n**Progress:** %d/%d tasks completed", #completed_todos, #todos)
-      
-      sidebar:update_content(plan_text, { focus = false, scroll = false })
+
+      -- No plan found
+      sidebar:update_content("No plan available.\n\nPlans will appear here when the agent creates a plan via plan mode.", { focus = false, scroll = false })
       if cb then cb(args) end
     end,
     ["toggle-full-screen"] = function(sidebar, args, cb)
@@ -2026,6 +2075,10 @@ Use `/compact` to update the memory with recent messages.]],
       require("avante.prompt_selector").open()
       if cb then cb(args) end
     end,
+    fork = function(sidebar, args, cb)
+      sidebar:fork_thread()
+      if cb then cb(args) end
+    end,
   }
 
   local builtin_commands = vim
@@ -2038,6 +2091,7 @@ Use `/compact` to update the memory with recent messages.]],
           description = item.description,
           callback = builtin_cbs[item.name],
           details = item.shorthelp and table.concat({ item.shorthelp, item.description }, "\n") or item.description,
+          source = "builtin",
         }
       end
     )

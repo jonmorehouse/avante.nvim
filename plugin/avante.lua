@@ -266,6 +266,11 @@ cmd("Modes", function()
   vim.keymap.set("n", "q", "<cmd>close<cr>", { buffer = buf, noremap = true, silent = true })
   vim.keymap.set("n", "<Esc>", "<cmd>close<cr>", { buffer = buf, noremap = true, silent = true })
 end, { desc = "avante: show available session modes" })
+cmd("Options", function(args)
+  require("avante.config_option_selector").open({
+    category = args.args ~= "" and args.args or nil,
+  })
+end, { nargs = "?", desc = "avante: open agent config options selector" })
 cmd("Plan", function()
   local sidebar = require("avante").get()
   if not sidebar then

@@ -25,6 +25,7 @@ local AcpConnection = require("avante.acp_connection")
 ---@field on_session_loaded? fun(session_id: string, result: table|nil)
 ---@field on_session_expired? fun(old_session_id: string)
 ---@field on_available_commands? fun(commands: avante.acp.AvailableCommand[])
+---@field on_config_options_change? fun(config_options: avante.acp.ConfigOption[])
 
 ---@class avante.AcpPlanStats
 ---@field total number
@@ -43,6 +44,8 @@ local AcpConnection = require("avante.acp_connection")
 ---@field plan_entries avante.acp.PlanEntry[]
 ---@field current_mode_id string|nil
 ---@field available_modes avante.acp.SessionMode[]
+---@field available_commands avante.acp.AvailableCommand[]
+---@field config_options avante.acp.ConfigOption[]|nil
 ---@field in_plan_mode boolean
 ---@field plan_presented boolean
 ---@field title string|nil
@@ -211,6 +214,22 @@ function AcpThread:initialize_modes()
     self.current_mode_id = nil
     Utils.debug("Agent does not provide session modes")
   end
+
+  -- Initialize config options (ACP spec: supersedes modes)
+  if self.connection:has_config_options() then
+    self.config_options = self.connection:all_config_options()
+    Utils.debug("Initialized " .. #self.config_options .. " config options from agent")
+
+    -- Wire up config options change callback
+    self.connection.on_config_options_changed = function(config_options)
+      vim.schedule(function()
+        self.config_options = config_options
+        if self.callbacks.on_config_options_change then
+          self.callbacks.on_config_options_change(config_options)
+        end
+      end)
+    end
+  end
 end
 
 --- Cycle to next mode
@@ -302,6 +321,12 @@ function AcpThread:handle_session_update(update)
     -- Mode updates are handled by the connection layer via on_mode_changed callback
     -- But we also update local state
     self.current_mode_id = update.currentModeId
+  elseif update.sessionUpdate == "config_options_update" then
+    -- Config options updates are handled by the connection layer via on_config_options_changed callback
+    -- But we also update local state
+    if update.configOptions then
+      self.config_options = update.configOptions
+    end
   end
 end
 
@@ -324,6 +349,45 @@ function AcpThread:_handle_plan_update(update)
     }
     table.insert(todos, todo)
   end
+
+  if self.callbacks.on_plan_update then
+    vim.schedule(function()
+      self.callbacks.on_plan_update(todos)
+    end)
+  end
+end
+
+--- Convert TodoWrite tool input into plan entries and trigger plan update
+---@param todos_input table[] Array of {content, status, activeForm} from TodoWrite
+function AcpThread:_update_todos_from_tool(todos_input)
+  local todos = {}
+  for idx, item in ipairs(todos_input) do
+    -- Map TodoWrite statuses to our plan statuses
+    local status = "todo"
+    if item.status == "in_progress" then
+      status = "doing"
+    elseif item.status == "completed" then
+      status = "done"
+    elseif item.status == "pending" then
+      status = "todo"
+    end
+    table.insert(todos, {
+      id = tostring(idx),
+      content = item.content or item.activeForm or "",
+      status = status,
+    })
+  end
+
+  -- Also update plan_entries for consistency
+  self.plan_entries = {}
+  for _, todo in ipairs(todos) do
+    table.insert(self.plan_entries, {
+      content = todo.content,
+      status = todo.status == "doing" and "in_progress" or (todo.status == "done" and "completed" or "pending"),
+    })
+  end
+
+  Utils.debug("TodoWrite intercepted with " .. #todos .. " entries")
 
   if self.callbacks.on_plan_update then
     vim.schedule(function()
@@ -447,6 +511,15 @@ function AcpThread:_handle_tool_call(update)
     self.plan_presented = true
     Utils.info("Plan ready for approval - provide feedback or approve to proceed")
   end
+
+  -- Intercept TodoWrite tool calls to populate the plan container
+  if tool_title:match("TodoWrite") or tool_title:match("write_todos") then
+    local raw = update.rawInput or {}
+    local todos_input = raw.todos
+    if todos_input and type(todos_input) == "table" and #todos_input > 0 then
+      self:_update_todos_from_tool(todos_input)
+    end
+  end
 end
 
 ---@param update avante.acp.ToolCallUpdate
@@ -544,6 +617,15 @@ function AcpThread:_handle_tool_call_update(update)
       end)
     end
   end
+
+  -- Intercept TodoWrite tool call updates to populate the plan container
+  if tool_title:match("TodoWrite") or tool_title:match("write_todos") then
+    local raw = update.rawInput or {}
+    local todos_input = raw.todos
+    if todos_input and type(todos_input) == "table" and #todos_input > 0 then
+      self:_update_todos_from_tool(todos_input)
+    end
+  end
 end
 
 ---@param update avante.acp.AvailableCommandsUpdate
@@ -560,10 +642,17 @@ function AcpThread:_handle_available_commands(update)
   if has_cmp then
     local slash_commands_id = require("avante").slash_commands_id
     if slash_commands_id ~= nil then cmp.unregister_source(slash_commands_id) end
+    -- Store on thread for per-session tracking
+    self.available_commands = commands
+
     for _, command in ipairs(commands) do
       local exists = false
       for _, command_ in ipairs(Config.slash_commands) do
         if command_.name == command.name then
+          -- Update existing entry to mark as ACP-sourced
+          command_.source = "acp"
+          command_.description = command.description
+          command_.details = command.description
           exists = true
           break
         end
@@ -573,6 +662,7 @@ function AcpThread:_handle_available_commands(update)
           name = command.name,
           description = command.description,
           details = command.description,
+          source = "acp",
         })
       end
     end

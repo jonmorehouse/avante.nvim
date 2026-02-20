@@ -1217,6 +1217,20 @@ function M._stream_acp(opts)
               end)
             end
 
+            -- Intercept TodoWrite tool calls to populate the plan container
+            if tool_title:match("TodoWrite") or tool_title:match("write_todos") then
+              local raw = update.rawInput or {}
+              local todos_input = raw.todos
+              if todos_input and type(todos_input) == "table" and #todos_input > 0 then
+                vim.schedule(function()
+                  local sidebar = require("avante").get()
+                  if sidebar and sidebar.acp_thread then
+                    sidebar.acp_thread:_update_todos_from_tool(todos_input)
+                  end
+                end)
+              end
+            end
+
             local sidebar = require("avante").get()
 
             if
@@ -1332,6 +1346,9 @@ function M._stream_acp(opts)
                 local exists = false
                 for _, command_ in ipairs(Config.slash_commands) do
                   if command_.name == command.name then
+                    command_.source = "acp"
+                    command_.description = command.description
+                    command_.details = command.description
                     exists = true
                     break
                   end
@@ -1341,6 +1358,7 @@ function M._stream_acp(opts)
                     name = command.name,
                     description = command.description,
                     details = command.description,
+                    source = "acp",
                   })
                 end
               end
@@ -1394,6 +1412,17 @@ function M._stream_acp(opts)
                 end
               end
             end
+            sidebar.scroll = true
+            sidebar._history_cache_invalidated = true
+            sidebar:update_content("")
+            return
+          end
+
+          -- Auto-approve plan mode transitions — these are state signals, not dangerous actions
+          local tool_title_for_approval = tool_call.title or ""
+          if tool_title_for_approval:match("ExitPlanMode") or tool_title_for_approval:match("EnterPlanMode") then
+            local acp_mapped_options = ACPConfirmAdapter.map_acp_options(options)
+            callback(acp_mapped_options.yes or acp_mapped_options.all)
             sidebar.scroll = true
             sidebar._history_cache_invalidated = true
             sidebar:update_content("")

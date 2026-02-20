@@ -573,7 +573,7 @@ M._defaults = {
     acp_default_mode = nil,
     --- Whether to prompt before exiting when there are active ACP sessions
     ---@type boolean
-    prompt_on_exit_with_active_session = true,
+    prompt_on_exit_with_active_session = false,
     --- Status line configuration for input container
     ---@type table
     status_line = {
@@ -701,6 +701,7 @@ M._defaults = {
       switch_windows = "<Tab>",
       reverse_switch_windows = "<C-S-Tab>",
       toggle_code_window = "x",
+      toggle_plan = "<D-t>",
       toggle_fullscreen_edit = "<S-f>",
       toggle_input_fullscreen = "<C-f>",
       remove_file = "d",

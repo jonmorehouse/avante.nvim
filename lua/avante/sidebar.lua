@@ -138,6 +138,7 @@ function Sidebar:new(id)
     _plan_bufnr = nil,
     _plan_path = nil,
     follow_mode = Config.behaviour.acp_follow_agent_locations,
+    _plan_visible = true,
     _current_session_ctx = nil,
   }, Sidebar)
 end
@@ -482,6 +483,11 @@ function Sidebar:ensure_acp_thread()
     self.acp_thread.available_modes = self.acp_client:all_modes()
   end
 
+  -- Sync config options
+  if self.acp_client and self.acp_client:has_config_options() then
+    self.acp_thread.config_options = self.acp_client:all_config_options()
+  end
+
   -- Wire up callbacks that update the sidebar
   self.acp_thread:set_callbacks({
     on_state_change = function(new_state, _old_state)
@@ -500,6 +506,12 @@ function Sidebar:ensure_acp_thread()
       vim.schedule(function()
         self:update_plan(todos)
         self:show_input_hint() -- refresh plan progress in status line
+      end)
+    end,
+    on_config_options_change = function(config_options)
+      vim.schedule(function()
+        self:render_result()
+        self:show_input_hint()
       end)
     end,
   })
@@ -580,6 +592,7 @@ function Sidebar:load_thread(opts)
 end
 
 --- Fork the current thread, creating a new conversation branching from the current messages.
+--- After forking, prompts the user for what they want to do with the fork.
 function Sidebar:fork_thread()
   if not self.chat_history then
     Utils.warn("No active thread to fork")
@@ -587,7 +600,6 @@ function Sidebar:fork_thread()
   end
 
   local Path = require("avante.path")
-  local AcpThread = require("avante.acp_thread")
 
   -- Create a new history with a copy of current messages
   local forked = Path.history.new(self.code.bufnr)
@@ -613,6 +625,18 @@ function Sidebar:fork_thread()
   self:show_input_hint()
 
   Utils.info("Forked thread: " .. forked.filename)
+
+  -- Prompt user for what to do with this fork
+  vim.schedule(function()
+    vim.ui.input({ prompt = "What would you like to do with this fork? " }, function(input)
+      if not input or input == "" then return end
+      -- Write the prompt into the input buffer and submit
+      if self.containers and self.containers.input and vim.api.nvim_buf_is_valid(self.containers.input.bufnr) then
+        vim.api.nvim_buf_set_lines(self.containers.input.bufnr, 0, -1, false, vim.split(input, "\n"))
+        self:handle_submit(input)
+      end
+    end)
+  end)
 end
 
 --- Rename the current thread.
@@ -1428,16 +1452,30 @@ function Sidebar:render_result()
 
   local header_text = Utils.icon("󰭻 ") .. title
 
-  -- Add mode indicator
-  if self.current_mode_id then
-    local mode_name = self.current_mode_id:upper()
-    if self.acp_client then
-      local mode = self.acp_client:mode_by_id(self.current_mode_id)
-      if mode then
-        mode_name = mode.name
+  -- Add mode indicator (prefer configOptions over legacy modes)
+  local mode_display = nil
+  if self.acp_client and self.acp_client:has_config_options() then
+    local config_opts = self.acp_client:all_config_options()
+    local mode_opt = vim.iter(config_opts):find(function(o) return o.category == "mode" end)
+    if mode_opt then
+      mode_display = mode_opt.currentValue:upper()
+      for _, val in ipairs(mode_opt.options) do
+        if val.value == mode_opt.currentValue then
+          mode_display = val.name
+          break
+        end
       end
     end
-    header_text = header_text .. " " .. Utils.icon("") .. "[" .. mode_name .. "]"
+  end
+  if not mode_display and self.current_mode_id then
+    mode_display = self.current_mode_id:upper()
+    if self.acp_client then
+      local mode = self.acp_client:mode_by_id(self.current_mode_id)
+      if mode then mode_display = mode.name end
+    end
+  end
+  if mode_display then
+    header_text = header_text .. " " .. Utils.icon("") .. "[" .. mode_display .. "]"
   end
 
   self:render_header(
@@ -1721,6 +1759,22 @@ function Sidebar:bind_sidebar_keys(codeblocks)
     function() self:cycle_mode() end,
     { buffer = self.containers.result.bufnr, noremap = true, silent = true, desc = "avante: cycle session mode" }
   )
+  vim.keymap.set(
+    "n",
+    "O",
+    function() require("avante.config_option_selector").open() end,
+    { buffer = self.containers.result.bufnr, noremap = true, silent = true, desc = "avante: open config options selector" }
+  )
+  -- Toggle plan container (Cmd-t) — bind in both normal and insert mode for result buffer
+  local toggle_plan_key = Config.mappings.sidebar.toggle_plan
+  if toggle_plan_key then
+    vim.keymap.set(
+      { "n", "i" },
+      toggle_plan_key,
+      function() self:toggle_plan_container() end,
+      { buffer = self.containers.result.bufnr, noremap = true, silent = true, desc = "avante: toggle plan/tasks panel" }
+    )
+  end
 end
 
 function Sidebar:unbind_sidebar_keys()
@@ -2798,6 +2852,8 @@ function Sidebar:new_chat(args, cb)
   self.current_tool_use_extmark_id = nil
   self._current_session_ctx = nil
   require("avante.changed_files").clear()
+  -- Clear stale ACP commands from previous session
+  Config.slash_commands = vim.tbl_filter(function(c) return c.source ~= "acp" end, Config.slash_commands)
   self:update_content("New chat", { focus = false, scroll = false, callback = function() self:focus_input() end })
   --- goto first line then go to last line
   vim.schedule(function()
@@ -3031,19 +3087,41 @@ function Sidebar:show_input_hint()
   local parts = {}
   local plan_mode_text = nil
 
-  -- 1. Mode indicator
+  -- 1. Mode indicator (prefer configOptions over legacy modes)
   if config.show_plan_mode then
-    if self.current_mode_id and self.acp_client then
-      local mode = self.acp_client:mode_by_id(self.current_mode_id)
-      local mode_name = mode and mode.name or self.current_mode_id:upper()
-      plan_mode_text = " " .. mode_name
-      table.insert(parts, plan_mode_text)
-    elseif self.current_mode_id then
-      plan_mode_text = " " .. self.current_mode_id:upper()
-      table.insert(parts, plan_mode_text)
-    else
-      plan_mode_text = "⚡ EXEC"
-      table.insert(parts, plan_mode_text)
+    local got_mode = false
+    -- Check configOptions first (ACP spec: supersedes modes)
+    if self.acp_client and self.acp_client:has_config_options() then
+      local config_opts = self.acp_client:all_config_options()
+      local mode_opt = vim.iter(config_opts):find(function(o) return o.category == "mode" end)
+      if mode_opt then
+        -- Find the display name for current value
+        local display = mode_opt.currentValue:upper()
+        for _, val in ipairs(mode_opt.options) do
+          if val.value == mode_opt.currentValue then
+            display = val.name
+            break
+          end
+        end
+        plan_mode_text = " " .. display
+        table.insert(parts, plan_mode_text)
+        got_mode = true
+      end
+    end
+    -- Fallback to legacy modes
+    if not got_mode then
+      if self.current_mode_id and self.acp_client then
+        local mode = self.acp_client:mode_by_id(self.current_mode_id)
+        local mode_name = mode and mode.name or self.current_mode_id:upper()
+        plan_mode_text = " " .. mode_name
+        table.insert(parts, plan_mode_text)
+      elseif self.current_mode_id then
+        plan_mode_text = " " .. self.current_mode_id:upper()
+        table.insert(parts, plan_mode_text)
+      else
+        plan_mode_text = "⚡ EXEC"
+        table.insert(parts, plan_mode_text)
+      end
     end
   end
 
@@ -3503,7 +3581,9 @@ function Sidebar:handle_submit(request)
     ---@type AvanteSlashCommand
     local cmd = vim.iter(cmds):filter(function(cmd) return cmd.name == command end):totable()[1]
     if cmd then
-      if cmd.callback then
+      -- ACP-sourced commands fall through to the agent unless they're local-only
+      local is_local_only = vim.tbl_contains(Config.local_only_commands, command)
+      if cmd.callback and (cmd.source ~= "acp" or is_local_only) then
         if command == "lines" then
           cmd.callback(self, args, function(args_)
             local _, _, question = args_:match("(%d+)-(%d+)%s+(.*)")
@@ -3965,6 +4045,12 @@ function Sidebar:create_input_container()
     end
   end
 
+  -- Toggle plan container from input buffer (Cmd-t)
+  if Config.mappings.sidebar.toggle_plan then
+    self.containers.input:map("n", Config.mappings.sidebar.toggle_plan, function() self:toggle_plan_container() end)
+    self.containers.input:map("i", Config.mappings.sidebar.toggle_plan, function() self:toggle_plan_container() end)
+  end
+
   api.nvim_set_option_value("filetype", "AvanteInput", { buf = self.containers.input.bufnr })
 
   -- Setup completion
@@ -4064,6 +4150,7 @@ function Sidebar:get_selected_code_container_height()
 end
 
 function Sidebar:get_plan_container_height()
+  if not self._plan_visible then return 0 end
   local history = Path.history.load(self.code.bufnr)
   local todo_count = #history.todos
   if todo_count == 0 then return 0 end
@@ -4245,6 +4332,20 @@ function Sidebar:adjust_plan_container_layout()
   api.nvim_win_set_height(self.containers.plan.winid, win_height)
 end
 
+--- Toggle plan container visibility (Cmd-t)
+function Sidebar:toggle_plan_container()
+  self._plan_visible = not self._plan_visible
+  if self._plan_visible then
+    self:create_plan_container()
+  else
+    if self.containers.plan and Utils.is_valid_container(self.containers.plan) then
+      self.containers.plan:unmount()
+    end
+    self.containers.plan = nil
+    self:adjust_layout()
+  end
+end
+
 function Sidebar:create_selected_files_container()
   if self.containers.selected_files then self.containers.selected_files:unmount() end
 
@@ -4408,6 +4509,16 @@ end
 
 function Sidebar:create_plan_container()
   Utils.debug("create_plan_container called, bufnr=" .. tostring(self.code.bufnr))
+
+  -- Respect toggle state — if user hid the plan, don't show it
+  if not self._plan_visible then
+    if self.containers.plan and Utils.is_valid_container(self.containers.plan) then
+      self.containers.plan:unmount()
+    end
+    self.containers.plan = nil
+    return
+  end
+
   local history = Path.history.load(self.code.bufnr)
   Utils.debug("Loaded history from disk, todos count=" .. #history.todos)
   if #history.todos == 0 then
