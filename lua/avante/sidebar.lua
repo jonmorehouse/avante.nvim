@@ -614,9 +614,16 @@ function Sidebar:fork_thread()
   -- Save the forked history
   Path.history.save(self.code.bufnr, forked)
 
+  -- Fork the AcpThread so the new session gets full conversation context (both roles)
+  local forked_acp_thread = nil
+  if self.acp_thread then
+    forked_acp_thread = self.acp_thread:fork()
+    forked_acp_thread.session_id = nil -- will get a new ACP session on first submit
+  end
+
   -- Switch to the forked thread
   self.chat_history = forked
-  self.acp_thread = nil
+  self.acp_thread = forked_acp_thread
   self.current_mode_id = nil
   self.available_modes = {}
 
@@ -2844,6 +2851,25 @@ end
 
 function Sidebar:new_chat(args, cb)
   local history = Path.history.new(self.code.bufnr)
+  -- Auto-detect worktree name if cwd is inside a git worktree
+  local wd = history.working_directory or vim.fn.getcwd()
+  local git_path = wd .. "/.git"
+  if vim.fn.filereadable(git_path) == 1 and vim.fn.isdirectory(git_path) == 0 then
+    local worktrees_root = Config.behaviour and Config.behaviour.worktrees_root
+    if worktrees_root then
+      local expanded_root = vim.fn.expand(worktrees_root)
+      if wd:sub(1, #expanded_root) == expanded_root then
+        local relative = wd:sub(#expanded_root + 2) -- skip trailing /
+        if relative ~= "" then
+          history.title = relative
+        end
+      end
+    end
+    -- Fallback: use the last path component as worktree name
+    if history.title == "untitled" then
+      history.title = vim.fn.fnamemodify(wd, ":t")
+    end
+  end
   Path.history.save(self.code.bufnr, history)
   self:reload_chat_history()
   self.current_state = nil
@@ -3167,7 +3193,24 @@ function Sidebar:show_input_hint()
     end
   end
 
-  -- 6. Plan progress
+  -- 6. Working directory
+  if config.show_working_directory then
+    local wd = (self.chat_history and self.chat_history.working_directory) or vim.fn.getcwd()
+    if wd then
+      -- Show path with ~ for home directory
+      local display_path = vim.fn.fnamemodify(wd, ":~")
+      -- Detect if this is a git worktree (worktrees have a .git file, not a .git directory)
+      local git_path = wd .. "/.git"
+      local is_worktree = vim.fn.filereadable(git_path) == 1 and vim.fn.isdirectory(git_path) == 0
+      if is_worktree then
+        table.insert(parts, "Worktree: " .. display_path)
+      else
+        table.insert(parts, "Dir: " .. display_path)
+      end
+    end
+  end
+
+  -- 7. Plan progress
   if config.show_plan_progress ~= false then
     local plan_progress = nil
     if self.acp_thread then
@@ -3188,14 +3231,26 @@ function Sidebar:show_input_hint()
   -- Build final text
   local hint_text
   if config.format then
-    -- Custom format string
+    -- Custom format string using named parts
+    local named_parts = {}
+    -- Rebuild named lookup from the parts we added
+    -- (parts are added conditionally, so use named table instead of indices)
     hint_text = config.format
-      :gsub("{plan_mode}", parts[1] or "")
-      :gsub("{following_status}", parts[2] or "")
-      :gsub("{tokens}", parts[3] or "")
-      :gsub("{submit_key}", parts[4] or "")
-      :gsub("{session_info}", parts[5] or "")
-      :gsub("{plan_progress}", parts[6] or "")
+    -- Replace each placeholder; since parts are conditional, build a named map
+    local part_names = {}
+    local part_idx = 0
+    if config.show_plan_mode then part_idx = part_idx + 1; part_names["plan_mode"] = parts[part_idx] end
+    if config.show_following_status then part_idx = part_idx + 1; part_names["following_status"] = parts[part_idx] end
+    if config.show_tokens and Config.behaviour.enable_token_counting then part_idx = part_idx + 1; part_names["tokens"] = parts[part_idx] end
+    if config.show_submit_key then part_idx = part_idx + 1; part_names["submit_key"] = parts[part_idx] end
+    if config.show_session_info then part_idx = part_idx + 1; part_names["session_info"] = parts[part_idx] end
+    if config.show_working_directory then part_idx = part_idx + 1; part_names["working_directory"] = parts[part_idx] end
+    if config.show_plan_progress ~= false then part_idx = part_idx + 1; part_names["plan_progress"] = parts[part_idx] end
+    for name, val in pairs(part_names) do
+      hint_text = hint_text:gsub("{" .. name .. "}", val or "")
+    end
+    -- Remove any unreplaced placeholders
+    hint_text = hint_text:gsub("{%w+}", "")
   else
     -- Default: join with " | "
     hint_text = table.concat(parts, " | ")
@@ -4099,7 +4154,6 @@ function Sidebar:create_input_container()
     buffer = self.containers.input.bufnr,
     callback = function()
       vim.cmd("noautocmd stopinsert")
-      self:close_input_hint()
     end,
   })
 
@@ -4116,8 +4170,6 @@ function Sidebar:create_input_container()
       local cur_win = api.nvim_get_current_win()
       if self.containers.input and cur_win == self.containers.input.winid then
         self:show_input_hint()
-      else
-        self:close_input_hint()
       end
     end,
   })

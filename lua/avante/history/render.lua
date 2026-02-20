@@ -551,8 +551,9 @@ local function tool_to_lines(item, message, messages, expanded)
   -- Compact single-line view for completed/failed tool calls (collapsed)
   if not expanded and state ~= "generating" then
     -- Custom collapsed view for AskUserQuestion
-    if item.name == "AskUserQuestion" then
-      local q = (item.input and (item.input.question or item.input.text)) or "Question"
+    if item.name == "AskUserQuestion" or raw_tool_name:match("AskUserQuestion") then
+      local input = item.input or (message.acp_tool_call and message.acp_tool_call.rawInput) or {}
+      local q = input.question or input.text or "Question"
       if #q > 40 then q = q:sub(1, 37) .. "..." end
       local answer = "..."
       if result and result.content then

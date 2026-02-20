@@ -574,6 +574,10 @@ M._defaults = {
     --- Whether to prompt before exiting when there are active ACP sessions
     ---@type boolean
     prompt_on_exit_with_active_session = false,
+    --- Base directory for git worktrees created by :AvanteChatNewWorktree
+    --- Set to a path like "~/worktrees" or nil to use the parent of the git root
+    ---@type string|nil
+    worktrees_root = nil,
     --- Status line configuration for input container
     ---@type table
     status_line = {
@@ -584,6 +588,7 @@ M._defaults = {
       show_tokens = true, -- Show token count
       show_submit_key = true, -- Show submit keybinding
       show_session_info = true, -- Show session mode and ID
+      show_working_directory = true, -- Show the chat's working directory
       format = nil, -- Custom format string: "{plan_mode} | {following_status} | {tokens} | {submit_key}"
     },
   },

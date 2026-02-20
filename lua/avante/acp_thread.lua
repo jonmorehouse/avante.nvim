@@ -593,12 +593,26 @@ function AcpThread:_handle_tool_call_update(update)
   -- Track file edits from ACP tool calls for the changed files list
   local ChangedFiles = require("avante.changed_files")
   local tool_title = update.title or ""
-  local is_write_tool = vim.tbl_contains(ChangedFiles.ACP_WRITE_TOOL_TITLES, tool_title)
+  local tool_kind = update.kind or ""
+  local is_write_tool = tool_kind == "edit" or tool_kind == "delete" or tool_kind == "move"
+  if not is_write_tool then
+    for _, name in ipairs(ChangedFiles.ACP_WRITE_TOOL_TITLES) do
+      if tool_title == name or tool_title:match("^" .. vim.pesc(name) .. "[^%w]") then
+        is_write_tool = true
+        break
+      end
+    end
+  end
   if is_write_tool then
     local raw = update.rawInput or {}
-    local path = raw.path or raw.file_path or raw.rel_path or raw.filepath
+    local path = raw.file_path or raw.path or raw.rel_path or raw.filepath
     if not path and update.locations and #update.locations > 0 then
       path = update.locations[1].path
+    end
+    -- Also try to extract path from the title (e.g. "Write(src/foo.lua)" or "Edit(src/foo.lua)")
+    if not path then
+      local title_path = tool_title:match("^%w+%((.+)%)$")
+      if title_path then path = title_path end
     end
     if path then
       vim.schedule(function()

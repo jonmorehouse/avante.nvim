@@ -199,7 +199,10 @@ function History.from_file(filepath)
         if not vim.islist(history.messages) then history.messages = {} end
         if not vim.islist(history.todos) then history.todos = {} end
         if not vim.islist(history.tags) then history.tags = {} end
-        if history.starred == nil then history.starred = false end
+        if history.pinned == nil then history.pinned = history.starred or false end
+        if history.last_seen_message_count == nil then
+          history.last_seen_message_count = #(history.messages or {})
+        end
         ---@cast history avante.ChatHistory
         history.filename = filepath_to_filename(filepath)
         return history

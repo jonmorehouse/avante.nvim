@@ -1026,6 +1026,8 @@ function M._stream_acp(opts)
   Utils.debug("use ACP", Config.provider)
   ---@type table<string, avante.HistoryMessage>
   local tool_call_messages = {}
+  ---@type table<string, string> Maps toolCallId to the user's selected answer text
+  local permission_answers = {}
   ---@type avante.HistoryMessage
   local last_tool_call_message = nil
   local acp_provider = Config.acp_providers[Config.provider]
@@ -1305,7 +1307,7 @@ function M._stream_acp(opts)
               tool_call_message = History.Message:new("assistant", {
                 type = "tool_use",
                 id = update.toolCallId,
-                name = "",
+                name = update.kind or update.title or "",
               })
               tool_call_messages[update.toolCallId] = tool_call_message
               tool_call_message.acp_tool_call = update
@@ -1323,10 +1325,13 @@ function M._stream_acp(opts)
             elseif update.status == "completed" or update.status == "failed" then
               tool_call_message.is_calling = false
               tool_call_message.state = "generated"
+              -- Use stored permission answer if available (e.g., "Yes, and auto-accept edits")
+              local answer_content = permission_answers[update.toolCallId]
+              permission_answers[update.toolCallId] = nil
               tool_result_message = History.Message:new("assistant", {
                 type = "tool_result",
                 tool_use_id = update.toolCallId,
-                content = nil,
+                content = answer_content,
                 is_error = update.status == "failed",
                 is_user_declined = update.status == "cancelled",
               })
@@ -1401,6 +1406,7 @@ function M._stream_acp(opts)
             -- Auto-reject in plan mode
             Utils.warn("Plan mode: " .. (rejection_reason or "Tool not allowed"))
             local acp_mapped_options = ACPConfirmAdapter.map_acp_options(options)
+            permission_answers[tool_call.toolCallId] = "Rejected (plan mode)"
             if acp_mapped_options.no then
               callback(acp_mapped_options.no)
             else
@@ -1422,6 +1428,7 @@ function M._stream_acp(opts)
           local tool_title_for_approval = tool_call.title or ""
           if tool_title_for_approval:match("ExitPlanMode") or tool_title_for_approval:match("EnterPlanMode") then
             local acp_mapped_options = ACPConfirmAdapter.map_acp_options(options)
+            permission_answers[tool_call.toolCallId] = "Auto-approved"
             callback(acp_mapped_options.yes or acp_mapped_options.all)
             sidebar.scroll = true
             sidebar._history_cache_invalidated = true
@@ -1439,16 +1446,29 @@ function M._stream_acp(opts)
           end
 
           local description = HistoryRender.get_tool_display_name(message)
-          LLMToolHelpers.confirm(description, function(ok)
+          LLMToolHelpers.confirm(description, function(ok, selected_option_id)
             local acp_mapped_options = ACPConfirmAdapter.map_acp_options(options)
 
+            local chosen_option_id
             if ok and opts.session_ctx and opts.session_ctx.always_yes then
-              callback(acp_mapped_options.all or acp_mapped_options.yes)
+              chosen_option_id = acp_mapped_options.all or acp_mapped_options.yes
             elseif ok then
-              callback(acp_mapped_options.yes or acp_mapped_options.all)
+              chosen_option_id = acp_mapped_options.yes or acp_mapped_options.all
             else
-              callback(acp_mapped_options.no)
+              chosen_option_id = selected_option_id or acp_mapped_options.no
             end
+
+            -- Store the selected option name for rendering in the tool result
+            if chosen_option_id then
+              for _, opt in ipairs(options) do
+                if opt.optionId == chosen_option_id then
+                  permission_answers[tool_call.toolCallId] = opt.name
+                  break
+                end
+              end
+            end
+
+            callback(chosen_option_id)
 
             sidebar.permission_question_text = nil
             sidebar.scroll = true
@@ -1900,28 +1920,32 @@ function M._continue_stream_acp(opts, acp_client, session_id)
     end
   else
     if donot_use_builtin_system_prompt then
-      -- Include all user messages for better context preservation
+      -- Include both user and assistant messages for full context preservation
+      -- This is critical for forked threads where the new ACP session needs
+      -- the complete conversation history (not just user messages)
       for _, message in ipairs(history_messages) do
-        if message.message.role == "user" then
+        local role = message.message.role
+        if role == "user" or role == "assistant" then
+          local role_tag = role == "user" and "previous_user_message" or "previous_assistant_message"
           local content = message.message.content
           if type(content) == "table" then
             for _, item in ipairs(content) do
               if type(item) == "string" then
                 table.insert(prompt, {
                   type = "text",
-                  text = item,
+                  text = "<" .. role_tag .. ">" .. item .. "</" .. role_tag .. ">",
                 })
               elseif type(item) == "table" and item.type == "text" then
                 table.insert(prompt, {
                   type = "text",
-                  text = item.text,
+                  text = "<" .. role_tag .. ">" .. (item.text or item.content or "") .. "</" .. role_tag .. ">",
                 })
               end
             end
-          else
+          elseif type(content) == "string" then
             table.insert(prompt, {
               type = "text",
-              text = content,
+              text = "<" .. role_tag .. ">" .. content .. "</" .. role_tag .. ">",
             })
           end
         end

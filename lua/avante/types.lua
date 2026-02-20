@@ -528,7 +528,8 @@ vim.g.avante_login = vim.g.avante_login
 ---@field selected_files string[] | nil
 ---@field tags string[] | nil
 ---@field parent_thread_id string | nil
----@field starred boolean | nil
+---@field pinned boolean | nil
+---@field last_seen_message_count integer | nil
 ---
 ---@class avante.ChatMemory
 ---@field content string

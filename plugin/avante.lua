@@ -100,10 +100,8 @@ end, {
 })
 cmd("ChatNew", function(opts)
   local args = Utils.parse_args(opts.fargs)
-  args.ask = false
-  args.new_chat = true
-  require("avante.api").ask(args)
-end, { desc = "avante: create new chat", nargs = "*", complete = ask_complete })
+  require("avante.api").new_chat_picker(args)
+end, { desc = "avante: create new chat (with worktree picker if configured)", nargs = "*", complete = ask_complete })
 cmd("Toggle", function() require("avante").toggle() end, { desc = "avante: toggle AI panel" })
 cmd("Build", function(opts)
   local args = Utils.parse_args(opts.fargs)
@@ -184,6 +182,7 @@ cmd("ShowRepoMap", function() require("avante.repo_map").show() end, { desc = "a
 cmd("Models", function() require("avante.model_selector").open() end, { desc = "avante: show models" })
 cmd("History", function() require("avante.api").select_history() end, { desc = "avante: show histories" })
 cmd("Threads", function() require("avante.api").view_threads() end, { desc = "avante: view all threads with telescope" })
+cmd("PinnedThreads", function() require("avante.api").view_pinned_threads() end, { desc = "avante: view pinned threads with unread detection" })
 cmd("PlanModeToggle", function() require("avante.api").toggle_plan_mode() end, { desc = "avante: toggle plan-only mode" })
 cmd("PlanMode", function() require("avante.api").toggle_plan_mode() end, { desc = "avante: toggle plan-only mode (deprecated, use PlanModeToggle)" })
 cmd("Debug", function()
