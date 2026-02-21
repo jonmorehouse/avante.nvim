@@ -3788,14 +3788,25 @@ function Sidebar:handle_submit(request)
       local should_notify = (stop_opts.reason == "complete" and Config.notifications.notify_on_complete)
         or (stop_opts.error and stop_opts.error ~= vim.NIL and Config.notifications.notify_on_error)
         or (stop_opts.reason == "cancelled" and Config.notifications.notify_on_cancel)
-      
+
       if should_notify then
         local ok, Notifications = pcall(require, "avante.notifications")
         if ok then
           local session_id = self.chat_history.acp_session_id or "internal_" .. self.bufnr
           local task_summary = self:_extract_task_summary()
-          Notifications.on_agent_complete(session_id, stop_opts, task_summary)
+          local thread_title = self.chat_history and self.chat_history.title or nil
+          Notifications.on_agent_complete(session_id, stop_opts, task_summary, thread_title)
         end
+      end
+    end
+
+    -- In-editor notification for pinned threads (visible even when on a different thread)
+    if self.chat_history and self.chat_history.pinned then
+      local thread_title = self.chat_history.title or "Pinned thread"
+      if stop_opts.reason == "complete" or (not stop_opts.error and stop_opts.reason ~= "cancelled") then
+        Utils.info("[Pinned] " .. thread_title .. " completed. Use :AvantePinnedThreads to view.")
+      elseif stop_opts.error and stop_opts.error ~= vim.NIL then
+        Utils.warn("[Pinned] " .. thread_title .. " failed. Use :AvantePinnedThreads to view.")
       end
     end
 

@@ -437,6 +437,71 @@ function M.view_pinned_threads()
   require("avante.thread_viewer").open(buf, make_thread_open_callback(buf), { filter = "pinned", show_unread = true })
 end
 
+---Get sorted list of pinned thread filenames
+---@return string[] filenames
+---@return integer current_index (0 if current thread is not pinned)
+local function get_pinned_thread_list()
+  local Path = require("avante.path")
+  local History = require("avante.history")
+  local all = Path.history.list_all()
+  local pinned = {}
+  for _, h in ipairs(all) do
+    if h.pinned then table.insert(pinned, h) end
+  end
+  -- Sort by most recent message timestamp descending
+  table.sort(pinned, function(a, b)
+    local a_msgs = History.get_history_messages(a)
+    local b_msgs = History.get_history_messages(b)
+    local a_time = #a_msgs > 0 and a_msgs[#a_msgs].timestamp or a.timestamp
+    local b_time = #b_msgs > 0 and b_msgs[#b_msgs].timestamp or b.timestamp
+    return a_time > b_time
+  end)
+  -- Find current thread index
+  local sidebar = require("avante").get()
+  local current_filename = sidebar and sidebar.chat_history and sidebar.chat_history.filename or nil
+  local current_idx = 0
+  local filenames = {}
+  for i, h in ipairs(pinned) do
+    table.insert(filenames, h.filename)
+    if current_filename and h.filename == current_filename then
+      current_idx = i
+    end
+  end
+  return filenames, current_idx
+end
+
+---Cycle to next/prev pinned thread
+---@param direction integer 1 for next, -1 for prev
+local function cycle_pinned_thread(direction)
+  local Utils = require("avante.utils")
+  local Path = require("avante.path")
+  local filenames, current_idx = get_pinned_thread_list()
+  if #filenames == 0 then
+    Utils.warn("No pinned threads. Use /pin to pin a thread.")
+    return
+  end
+  local next_idx
+  if current_idx == 0 then
+    -- Not on a pinned thread, go to first
+    next_idx = 1
+  else
+    next_idx = ((current_idx - 1 + direction) % #filenames) + 1
+  end
+  local buf = vim.api.nvim_get_current_buf()
+  local open_cb = make_thread_open_callback(buf)
+  open_cb(filenames[next_idx])
+end
+
+---Switch to the next pinned thread
+function M.next_pinned_thread()
+  cycle_pinned_thread(1)
+end
+
+---Switch to the previous pinned thread
+function M.prev_pinned_thread()
+  cycle_pinned_thread(-1)
+end
+
 --- Open sidebar with a new chat in a specific directory
 ---@param dir string Absolute path to cd into
 ---@param title string|nil Optional thread title
