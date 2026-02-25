@@ -459,7 +459,7 @@ local function show_telescope_picker(histories, bufnr, cb, pickers, finders, con
                 if selection.history and selection.history._is_external then
                   external_session_id = selection.history.acp_session_id
                 end
-                cb(selection.value, external_session_id)
+                cb(selection.value, external_session_id, selection.history)
               end
             end)
           end
@@ -564,12 +564,18 @@ function M.open_with_telescope(bufnr, cb, opts)
           session_map[session_id] = history
           Utils.debug("Added local history with session_id: " .. session_id)
         else
-          -- Session already exists - check if we should update
-          -- Prefer histories with more messages
-          local existing_msg_count = #(History.get_history_messages(session_map[session_id]))
-          local new_msg_count = #(History.get_history_messages(history))
-          if new_msg_count > existing_msg_count then
-            Utils.debug("Replacing session " .. session_id .. " with more complete history (" .. new_msg_count .. " vs " .. existing_msg_count .. " messages)")
+          -- Session already exists - prefer the most recently modified copy
+          -- This ensures that pin/unpin changes are picked up from the freshest save
+          local existing = session_map[session_id]
+          local existing_msgs = History.get_history_messages(existing)
+          local new_msgs = History.get_history_messages(history)
+          local existing_time = #existing_msgs > 0 and existing_msgs[#existing_msgs].timestamp or existing.timestamp
+          local new_time = #new_msgs > 0 and new_msgs[#new_msgs].timestamp or history.timestamp
+          if new_time > existing_time then
+            Utils.debug("Replacing session " .. session_id .. " with more recent copy")
+            session_map[session_id] = history
+          elseif new_time == existing_time and #new_msgs > #(History.get_history_messages(existing)) then
+            Utils.debug("Replacing session " .. session_id .. " with more complete copy (same timestamp)")
             session_map[session_id] = history
           else
             Utils.debug("Skipping duplicate session: " .. session_id)

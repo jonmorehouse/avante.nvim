@@ -239,7 +239,13 @@ function Sidebar:open(opts)
   end
 
   local acp_provider = Config.acp_providers[Config.provider]
-  if acp_provider then self:handle_submit("") end
+  if acp_provider and not opts.skip_acp_connect then
+    -- If we have a persisted session, flag it for loading on connect
+    if self.chat_history and self.chat_history.acp_session_id then
+      self._load_existing_session = true
+    end
+    self:handle_submit("")
+  end
 
   return self
 end
@@ -385,7 +391,9 @@ function Sidebar:toggle(opts)
 end
 
 ---Initialize available modes from ACP client (no fallback)
-function Sidebar:initialize_modes()
+---@param opts? { skip_set_default_mode?: boolean }
+function Sidebar:initialize_modes(opts)
+  opts = opts or {}
   if self.acp_client and self.acp_client:has_modes() then
     -- Server provides modes
     self.available_modes = vim.tbl_map(function(m) return m.id end, self.acp_client:all_modes())
@@ -415,9 +423,10 @@ function Sidebar:initialize_modes()
     end
 
     -- Set default mode if configured and available (like Zed does after session/new)
+    -- Skip for loaded sessions — the session already has its own mode
     local default_mode = Config.behaviour.acp_default_mode
     Utils.debug("acp_default_mode config: " .. tostring(default_mode))
-    if default_mode and self.chat_history.acp_session_id then
+    if default_mode and self.chat_history.acp_session_id and not opts.skip_set_default_mode then
       local has_mode = vim.tbl_contains(self.available_modes, default_mode)
       if has_mode then
         -- Only set if not already in the desired mode
@@ -3874,6 +3883,9 @@ function Sidebar:handle_submit(request)
       end
     end
 
+    -- Capture current generation so stale callbacks from prior sessions are ignored
+    local session_generation = self._acp_session_generation or 0
+
     local stream_options = vim.tbl_deep_extend("force", generate_prompts_options, {
       just_connect_acp_client = request == "",
       _load_existing_session = self._load_existing_session or false,
@@ -3886,6 +3898,8 @@ function Sidebar:handle_submit(request)
       sidebar = self,
       acp_client = self.acp_client,
       on_save_acp_client = function(client)
+        -- Guard against stale callbacks from prior session attempts
+        if (self._acp_session_generation or 0) ~= session_generation then return end
         self.acp_client = client
         -- Note: modes are initialized after session creation, not here
         -- Ensure AcpThread is created/synced
@@ -3893,6 +3907,8 @@ function Sidebar:handle_submit(request)
       end,
       acp_session_id = self.chat_history.acp_session_id,
       on_save_acp_session_id = function(session_id)
+        -- Guard against stale callbacks from prior session attempts (e.g. restore overwrote)
+        if (self._acp_session_generation or 0) ~= session_generation then return end
         self.chat_history.acp_session_id = session_id
         -- Auto-tag with provider info on first session creation
         if not self.chat_history.tags or #self.chat_history.tags == 0 then

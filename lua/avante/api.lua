@@ -261,7 +261,7 @@ function M.select_history()
   local buf = vim.api.nvim_get_current_buf()
   require("avante.history_selector").open(buf, function(filename)
     vim.api.nvim_buf_call(buf, function()
-      if not require("avante").is_sidebar_open() then require("avante").open_sidebar({}) end
+      if not require("avante").is_sidebar_open() then require("avante").open_sidebar({ skip_acp_connect = true }) end
       local Path = require("avante.path")
       Path.history.save_latest_filename(buf, filename)
       local sidebar = require("avante").get()
@@ -279,58 +279,55 @@ end
 
 ---Shared callback factory for thread viewer pickers
 ---@param buf integer
----@return fun(filename: string, external_session_id?: string)
+---@return fun(filename: string, external_session_id?: string, history?: avante.ChatHistory)
 local function make_thread_open_callback(buf)
-  return function(filename, external_session_id)
+  return function(filename, external_session_id, history)
     vim.api.nvim_buf_call(buf, function()
-      if not require("avante").is_sidebar_open() then require("avante").open_sidebar({}) end
+      if not require("avante").is_sidebar_open() then require("avante").open_sidebar({ skip_acp_connect = true }) end
       local Path = require("avante.path")
       local Utils = require("avante.utils")
+      local Config = require("avante.config")
+      local sidebar = require("avante").get()
+
+      -- Change to the thread's working directory first (critical for cross-project threads)
+      local wd = history and history.working_directory
+      if not wd and external_session_id then
+        local thread_viewer = require("avante.thread_viewer")
+        local external_info = thread_viewer.get_external_session_info(external_session_id)
+        if external_info then wd = external_info.working_directory end
+      end
+      if wd and vim.fn.isdirectory(wd) == 1 then
+        vim.cmd("cd " .. vim.fn.fnameescape(wd))
+        Utils.info("Changed directory to: " .. wd)
+      end
 
       -- Handle external ACP sessions (sessions created outside Avante)
       if external_session_id then
-        -- Create a new Avante history for this external session
-        local sidebar = require("avante").get()
-        sidebar:reload_chat_history() -- This will create a new history if none exists
-
-        -- Set the ACP session ID to link it with the external session
+        sidebar:reload_chat_history()
         sidebar.chat_history.acp_session_id = external_session_id
+        if wd then sidebar.chat_history.working_directory = wd end
 
-        -- Get the working directory from the external session info
-        local thread_viewer = require("avante.thread_viewer")
-        local external_info = thread_viewer.get_external_session_info(external_session_id)
-        if external_info and external_info.working_directory then
-          sidebar.chat_history.working_directory = external_info.working_directory
-          if vim.fn.isdirectory(external_info.working_directory) == 1 then
-            vim.cmd("cd " .. vim.fn.fnameescape(external_info.working_directory))
-            Utils.info("Changed directory to: " .. external_info.working_directory)
-          end
-        end
+        Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
+        Path.history.save_latest_filename(sidebar.code.bufnr, sidebar.chat_history.filename)
 
-        -- Save the history with the ACP session ID
-        Path.history.save(buf, sidebar.chat_history)
-        Path.history.save_latest_filename(buf, sidebar.chat_history.filename)
-
-        -- Load the external session to sync its state
-        local Config = require("avante.config")
         if Config.acp_providers[Config.provider] then
           Utils.info("Loading external ACP session...")
-
-          sidebar.acp_client = nil -- Force reconnection
+          -- Bump generation to invalidate any in-flight callbacks from prior session
+          sidebar._acp_session_generation = (sidebar._acp_session_generation or 0) + 1
+          sidebar.acp_client = nil
           sidebar._on_session_load_complete = function()
-            sidebar:reload_chat_history()
+            -- Do NOT reload_chat_history() — it reads from disk and may lose the session_id.
+            -- chat_history is already correct in memory with the external session_id.
             sidebar:update_content_with_history()
             sidebar:create_plan_container()
             sidebar:initialize_token_count()
-            -- Update last_seen_message_count to clear unread indicator
             if sidebar.chat_history then
               sidebar.chat_history.last_seen_message_count = #(sidebar.chat_history.messages or {})
-              Path.history.save(buf, sidebar.chat_history)
+              Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
             end
             vim.schedule(function() sidebar:focus_input() end)
             sidebar._on_session_load_complete = nil
           end
-
           vim.schedule(function()
             sidebar._load_existing_session = true
             sidebar:handle_submit("")
@@ -341,82 +338,61 @@ local function make_thread_open_callback(buf)
           sidebar:initialize_token_count()
           vim.schedule(function() sidebar:focus_input() end)
         end
-
         return
       end
 
-      -- Handle regular Avante history
-      Path.history.save_latest_filename(buf, filename)
-      local sidebar = require("avante").get()
+      -- Handle regular Avante history — use the history object directly if available
+      if history then
+        sidebar.chat_history = history
+        Path.history.save(sidebar.code.bufnr, history)
+        Path.history.save_latest_filename(sidebar.code.bufnr, history.filename)
+      else
+        Path.history.save_latest_filename(sidebar.code.bufnr, filename)
+        sidebar:reload_chat_history()
+      end
 
-      -- Reload chat history to get the latest state from disk
-      sidebar:reload_chat_history()
-
-      -- If there's an ACP session, sync it with external changes
-      local history = sidebar.chat_history
-      if history and history.acp_session_id then
-        local Config = require("avante.config")
-
-        -- Change to the working directory of the thread FIRST
-        if history.working_directory and vim.fn.isdirectory(history.working_directory) == 1 then
-          vim.cmd("cd " .. vim.fn.fnameescape(history.working_directory))
-          Utils.info("Changed directory to: " .. history.working_directory)
-        end
-
+      local loaded_history = sidebar.chat_history
+      if loaded_history and loaded_history.acp_session_id then
         -- Restore selected files from history
-        if history.selected_files and sidebar.file_selector then
-          -- Clear existing selected files
+        if loaded_history.selected_files and sidebar.file_selector then
           sidebar.file_selector.selected_files = {}
-          -- Add files from history
-          for _, filepath in ipairs(history.selected_files) do
+          for _, filepath in ipairs(loaded_history.selected_files) do
             sidebar.file_selector:add_selected_file(filepath)
           end
         end
 
-        -- Load the ACP session to sync state from external changes
         if Config.acp_providers[Config.provider] then
           Utils.info("Loading ACP session to sync external changes...")
-
-          -- Force reconnection and session loading
-          sidebar.acp_client = nil -- Clear existing client to force reconnection
-
-          -- Set callback to update UI after session load completes
+          -- Bump generation to invalidate any in-flight callbacks from prior session
+          sidebar._acp_session_generation = (sidebar._acp_session_generation or 0) + 1
+          sidebar.acp_client = nil
           sidebar._on_session_load_complete = function()
-            -- Reload history to pick up any changes synced from ACP
-            sidebar:reload_chat_history()
+            -- Do NOT reload_chat_history() — it reads from disk and may lose the session_id
+            -- if the project root changed. chat_history is already correct in memory.
             sidebar:update_content_with_history()
             sidebar:create_plan_container()
             sidebar:initialize_token_count()
-            -- Update last_seen_message_count to clear unread indicator
             if sidebar.chat_history then
               sidebar.chat_history.last_seen_message_count = #(sidebar.chat_history.messages or {})
-              Path.history.save(buf, sidebar.chat_history)
+              Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
             end
-            vim.schedule(function()
-              sidebar:focus_input()
-            end)
-            -- Clear the callback
+            vim.schedule(function() sidebar:focus_input() end)
             sidebar._on_session_load_complete = nil
           end
-
-          -- Trigger a new connection with session loading
           vim.schedule(function()
             sidebar._load_existing_session = true
             sidebar:handle_submit("")
           end)
         else
-          -- For non-ACP providers, just update the content
           sidebar:update_content_with_history()
           sidebar:create_plan_container()
           sidebar:initialize_token_count()
           vim.schedule(function() sidebar:focus_input() end)
         end
       else
-        -- No ACP session, just update normally
-        -- Update last_seen_message_count for non-ACP histories too
-        if history then
-          history.last_seen_message_count = #(history.messages or {})
-          Path.history.save(buf, history)
+        if loaded_history then
+          loaded_history.last_seen_message_count = #(loaded_history.messages or {})
+          Path.history.save(sidebar.code.bufnr, loaded_history)
         end
         sidebar:update_content_with_history()
         sidebar:create_plan_container()
@@ -587,15 +563,86 @@ local function list_worktrees()
   return worktrees
 end
 
---- Show a telescope picker for creating a new chat: current dir, existing worktrees, or create new
+--- Show a telescope picker for creating a new chat: current dir, repo root, worktrees, favorite dirs
 ---@param ask_args table|nil Arguments to pass through to api.ask for "use current" path
 function M.new_chat_picker(ask_args)
   local Utils = require("avante.utils")
   local Config = require("avante.config")
 
   local worktrees_root = Config.behaviour and Config.behaviour.worktrees_root
-  if not worktrees_root then
-    -- No worktrees configured, just do a normal new chat
+  local favorite_root_dirs = Config.behaviour and Config.behaviour.favorite_root_dirs or {}
+
+  -- Build entries before deciding whether to show the picker
+  local entries = {}
+  local cwd = vim.fn.getcwd()
+  local cwd_abs = vim.fn.fnamemodify(cwd, ":p"):gsub("/$", "")
+
+  -- "Use current directory" option (always first)
+  table.insert(entries, {
+    display = "📂 " .. vim.fn.fnamemodify(cwd, ":~"),
+    ordinal = "use current directory " .. cwd,
+    action = "current",
+  })
+
+  -- Git repo root (if different from cwd)
+  local git_root = Utils.root.git()
+  if git_root then
+    local git_root_abs = vim.fn.fnamemodify(git_root, ":p"):gsub("/$", "")
+    if git_root_abs ~= cwd_abs then
+      table.insert(entries, {
+        display = "📁 " .. vim.fn.fnamemodify(git_root, ":t") .. " (" .. vim.fn.fnamemodify(git_root, ":~") .. ")",
+        ordinal = "repo root " .. git_root,
+        action = "dir",
+        dir = git_root,
+        title = vim.fn.fnamemodify(git_root, ":t"),
+      })
+    end
+  end
+
+  -- Favorite root dirs from config
+  for _, dir_raw in ipairs(favorite_root_dirs) do
+    local dir = vim.fn.expand(dir_raw)
+    if vim.fn.isdirectory(dir) == 1 then
+      local dir_abs = vim.fn.fnamemodify(dir, ":p"):gsub("/$", "")
+      -- Skip if same as cwd or git root (already listed)
+      if dir_abs ~= cwd_abs and (not git_root or dir_abs ~= vim.fn.fnamemodify(git_root, ":p"):gsub("/$", "")) then
+        table.insert(entries, {
+          display = "⭐ " .. vim.fn.fnamemodify(dir, ":t") .. " (" .. vim.fn.fnamemodify(dir, ":~") .. ")",
+          ordinal = "favorite " .. dir,
+          action = "dir",
+          dir = dir,
+          title = vim.fn.fnamemodify(dir, ":t"),
+        })
+      end
+    end
+  end
+
+  -- Existing worktrees (only if worktrees_root is configured)
+  if worktrees_root then
+    local worktrees = list_worktrees()
+    for _, wt in ipairs(worktrees) do
+      local wt_abs = vim.fn.fnamemodify(wt.path, ":p"):gsub("/$", "")
+      if wt_abs ~= cwd_abs then
+        table.insert(entries, {
+          display = "🌲 " .. wt.name .. " (" .. vim.fn.fnamemodify(wt.path, ":~") .. ")",
+          ordinal = wt.name .. " " .. wt.path,
+          action = "dir",
+          dir = wt.path,
+          title = wt.name,
+        })
+      end
+    end
+
+    -- "Create new worktree" option
+    table.insert(entries, {
+      display = "🌱 Create new worktree",
+      ordinal = "create new worktree",
+      action = "create",
+    })
+  end
+
+  -- If there's only the "current dir" entry, skip the picker
+  if #entries <= 1 then
     ask_args = ask_args or {}
     ask_args.ask = false
     ask_args.new_chat = true
@@ -617,34 +664,6 @@ function M.new_chat_picker(ask_args)
   local conf = require("telescope.config").values
   local actions = require("telescope.actions")
   local action_state = require("telescope.actions.state")
-
-  -- Build entries
-  local entries = {}
-
-  -- "Use current directory" option
-  table.insert(entries, {
-    display = "[*] Use current directory (" .. vim.fn.fnamemodify(vim.fn.getcwd(), ":~") .. ")",
-    ordinal = "use current directory",
-    action = "current",
-  })
-
-  -- Existing worktrees
-  local worktrees = list_worktrees()
-  for _, wt in ipairs(worktrees) do
-    table.insert(entries, {
-      display = "    " .. wt.name .. " (" .. vim.fn.fnamemodify(wt.path, ":~") .. ")",
-      ordinal = wt.name .. " " .. wt.path,
-      action = "select",
-      worktree = wt,
-    })
-  end
-
-  -- "Create new worktree" option
-  table.insert(entries, {
-    display = "[+] Create new worktree",
-    ordinal = "create new worktree",
-    action = "create",
-  })
 
   telescope.new({}, {
     prompt_title = "New Chat",
@@ -671,8 +690,8 @@ function M.new_chat_picker(ask_args)
           args.ask = false
           args.new_chat = true
           M.ask(args)
-        elseif entry.action == "select" then
-          open_new_chat_in_dir(entry.worktree.path, entry.worktree.name)
+        elseif entry.action == "dir" then
+          open_new_chat_in_dir(entry.dir, entry.title)
         elseif entry.action == "create" then
           vim.ui.input({ prompt = "Worktree name: " }, function(input)
             if input and input ~= "" then
@@ -759,6 +778,61 @@ function M.list_sessions()
       session.provider
     ))
   end
+end
+
+--- Restore an ACP session by its session ID.
+--- Creates/connects an ACP client, calls session/load, and wires up the sidebar.
+--- Works even without local Avante history cache.
+---@param session_id string The ACP session ID to restore
+function M.restore_acp_session(session_id)
+  if not session_id or session_id == "" then
+    Utils.error("Usage: :AvanteRestoreSession <session-id>")
+    return
+  end
+
+  if not Config.acp_providers[Config.provider] then
+    Utils.error("Current provider (" .. (Config.provider or "nil") .. ") is not an ACP provider")
+    return
+  end
+
+  local avante = require("avante")
+  if not avante.is_sidebar_open() then avante.open_sidebar({ skip_session_restore = true, skip_acp_connect = true }) end
+  local sidebar = avante.get()
+  if not sidebar then
+    Utils.error("Failed to open sidebar")
+    return
+  end
+
+  -- Bump session generation to invalidate any in-flight callbacks from prior session/new
+  sidebar._acp_session_generation = (sidebar._acp_session_generation or 0) + 1
+
+  -- Reset client so a fresh one connects and loads the session
+  sidebar.acp_client = nil
+  sidebar.acp_thread = nil
+
+  -- Set up chat_history with the session ID and persist to disk
+  local Path = require("avante.path")
+  if not sidebar.chat_history then
+    sidebar.chat_history = Path.history.new(sidebar.code.bufnr)
+  end
+  sidebar.chat_history.acp_session_id = session_id
+  Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
+
+  -- Set the load flag and callback
+  sidebar._load_existing_session = true
+  sidebar._on_session_load_complete = function()
+    -- Do NOT reload_chat_history() here — it reads from disk and may lose
+    -- the in-memory session_id if the project root changed or metadata is stale.
+    -- The chat_history is already correct in memory.
+    sidebar:update_content_with_history()
+    sidebar:create_plan_container()
+    sidebar:initialize_token_count()
+    vim.schedule(function() sidebar:focus_input() end)
+    sidebar._on_session_load_complete = nil
+  end
+
+  Utils.info("Restoring ACP session: " .. session_id)
+  sidebar:handle_submit("")
 end
 
 function M.add_buffer_files()

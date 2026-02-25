@@ -503,11 +503,6 @@ function AcpThread:_track_file_edit(update)
   local tool_title = update.title or stored_acp.title or ""
   local tool_kind = update.kind or stored_acp.kind or ""
 
-  Utils.debug("[file-tracking] _track_file_edit called: title=" .. tool_title
-    .. " kind=" .. tool_kind
-    .. " status=" .. (update.status or "nil")
-    .. " toolCallId=" .. (update.toolCallId or "nil"))
-
   local is_write_tool = tool_kind == "edit" or tool_kind == "delete" or tool_kind == "move"
   if not is_write_tool then
     for _, name in ipairs(ChangedFiles.ACP_WRITE_TOOL_TITLES) do
@@ -517,10 +512,7 @@ function AcpThread:_track_file_edit(update)
       end
     end
   end
-  if not is_write_tool then
-    Utils.debug("[file-tracking] NOT a write tool, skipping. title=" .. tool_title .. " kind=" .. tool_kind)
-    return
-  end
+  if not is_write_tool then return end
 
   local raw = update.rawInput or {}
   local path = raw.file_path or raw.path or raw.rel_path or raw.filepath
@@ -532,33 +524,17 @@ function AcpThread:_track_file_edit(update)
     local title_path = tool_title:match("^%w+%((.+)%)$")
     if title_path then path = title_path end
   end
-  if not path then
-    Utils.debug("[file-tracking] Write tool detected but no path found. raw keys: " .. vim.inspect(vim.tbl_keys(raw)))
-    return
-  end
-
-  Utils.debug("[file-tracking] Tracking file: " .. path .. " status=" .. (update.status or "nil"))
+  if not path then return end
 
   vim.schedule(function()
     local sidebar = require("avante").get()
-    if not sidebar then
-      Utils.debug("[file-tracking] No sidebar found")
-      return
-    end
-    if not sidebar._current_session_ctx then
-      Utils.debug("[file-tracking] No _current_session_ctx")
-      return
-    end
+    if not sidebar or not sidebar._current_session_ctx then return end
     local abs_path = vim.fn.fnamemodify(path, ":p")
     local Helpers = require("avante.llm_tools.helpers")
     if update.status == "pending" or update.status == "in_progress" then
-      Utils.debug("[file-tracking] Snapshotting: " .. abs_path)
       Helpers.snapshot_file_for_review(abs_path, sidebar._current_session_ctx)
     elseif update.status == "completed" then
-      Utils.debug("[file-tracking] Tracking edit: " .. abs_path)
       Helpers.track_edited_file(abs_path, sidebar._current_session_ctx, tool_title)
-    else
-      Utils.debug("[file-tracking] Unknown status: " .. (update.status or "nil"))
     end
   end)
 end

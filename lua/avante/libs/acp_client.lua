@@ -814,6 +814,13 @@ function ACPClient:initialize(callback)
     self.agent_capabilities = result.agentCapabilities
     self.auth_methods = result.authMethods or {}
 
+    -- Normalize capability: sessionCapabilities.resume → loadSession
+    -- The ACP protocol reports resume support under sessionCapabilities.resume,
+    -- but our code checks agentCapabilities.loadSession throughout.
+    if self.agent_capabilities and self.agent_capabilities.sessionCapabilities and self.agent_capabilities.sessionCapabilities.resume then
+      self.agent_capabilities.loadSession = true
+    end
+
     -- Parse session modes from agent capabilities
     if result.agentCapabilities and result.agentCapabilities.modes then
       self.session_modes = {

@@ -336,15 +336,15 @@ function H.autocmds()
     callback = function()
       Utils.debug("VimLeavePre: Starting ACP cleanup...")
 
-      -- Cancel any inflight requests first
-      local ok, Llm = pcall(require, "avante.llm")
-      if ok then pcall(function() Llm.cancel_inflight_request() end) end
-
+      -- Do NOT cancel inflight requests on exit — let the agent session continue
+      -- running on the server side. The session can be resumed later.
+      -- Only cancel/cleanup if explicitly configured to do so.
       if Config.behaviour.prompt_on_exit_with_active_session then
-        -- Only cleanup (kill) ACP processes if explicitly configured to prompt/stop
+        local ok, Llm = pcall(require, "avante.llm")
+        if ok then pcall(function() Llm.cancel_inflight_request() end) end
         M.cleanup_all_acp_clients()
       end
-      -- Otherwise, let sessions continue running in the background
+      -- Otherwise, just disconnect cleanly without cancelling sessions
 
       Utils.debug("VimLeavePre: ACP cleanup completed")
     end,

@@ -578,6 +578,10 @@ M._defaults = {
     --- Set to a path like "~/worktrees" or nil to use the parent of the git root
     ---@type string|nil
     worktrees_root = nil,
+    --- Additional directories to show in the :AvanteChatNew picker.
+    --- Each entry is a path (~ is expanded) that appears as a directory option.
+    ---@type string[]
+    favorite_root_dirs = {},
     --- Status line configuration for input container
     ---@type table
     status_line = {

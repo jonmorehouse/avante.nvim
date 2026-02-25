@@ -1092,94 +1092,11 @@ function M._stream_acp(opts)
   local acp_client = opts.acp_client
   local session_id = opts.acp_session_id
   
-  -- Track file edits from ACP tool calls for the /files command
-  local function track_acp_file_edit(update)
-    local ChangedFiles = require("avante.changed_files")
-    local tool_title = update.title or ""
-    local tool_kind = update.kind or ""
-
-    -- For tool_call_update events, fall back to stored tool call data
-    if tool_title == "" or tool_kind == "" then
-      local stored = tool_call_messages[update.toolCallId]
-      if stored and stored.acp_tool_call then
-        if tool_title == "" then tool_title = stored.acp_tool_call.title or "" end
-        if tool_kind == "" then tool_kind = stored.acp_tool_call.kind or "" end
-      end
-    end
-
-    local is_write_tool = tool_kind == "edit" or tool_kind == "delete" or tool_kind == "move"
-    if not is_write_tool then
-      for _, name in ipairs(ChangedFiles.ACP_WRITE_TOOL_TITLES) do
-        if tool_title == name or tool_title:match("^" .. vim.pesc(name) .. "[^%w]") then
-          is_write_tool = true
-          break
-        end
-      end
-    end
-    if not is_write_tool then return end
-
-    local raw = update.rawInput or {}
-    local path = raw.file_path or raw.path or raw.rel_path or raw.filepath
-    if not path and update.locations and #update.locations > 0 then
-      path = update.locations[1].path
-    end
-    if not path then
-      local title_path = tool_title:match("^%w+%((.+)%)$")
-      if title_path then path = title_path end
-    end
-    if not path then return end
-
-    Utils.debug("[file-tracking] llm.lua: path=" .. path .. " status=" .. (update.status or "nil") .. " kind=" .. tool_kind .. " title=" .. tool_title)
-
-    vim.schedule(function()
-      local session_ctx = opts.session_ctx
-      if not session_ctx then
-        Utils.debug("[file-tracking] llm.lua: no session_ctx")
-        return
-      end
-      local abs_path = vim.fn.fnamemodify(path, ":p")
-      local Helpers = require("avante.llm_tools.helpers")
-      if update.status == "pending" or update.status == "in_progress" then
-        Helpers.snapshot_file_for_review(abs_path, session_ctx)
-      elseif update.status == "completed" then
-        Helpers.track_edited_file(abs_path, session_ctx, tool_title)
-      end
-    end)
-  end
-
   -- CRITICAL FIX: Define handlers outside the client creation block
   -- so they can be updated even when reusing an existing client
   ---@type ACPHandlers
   local handlers = {
     on_session_update = function(update)
-      -- TEMPORARY DIAGNOSTIC: log all tool_call/tool_call_update events to a file
-      if update.sessionUpdate == "tool_call" or update.sessionUpdate == "tool_call_update" then
-        local log_path = vim.fn.stdpath("data") .. "/avante-file-tracking.log"
-        local f = io.open(log_path, "a")
-        if f then
-          f:write(os.date("[%H:%M:%S] ") .. update.sessionUpdate .. "\n")
-          f:write("  title=" .. tostring(update.title) .. "\n")
-          f:write("  kind=" .. tostring(update.kind) .. "\n")
-          f:write("  status=" .. tostring(update.status) .. "\n")
-          f:write("  toolCallId=" .. tostring(update.toolCallId) .. "\n")
-          if update.rawInput then
-            f:write("  rawInput keys=" .. table.concat(vim.tbl_keys(update.rawInput), ", ") .. "\n")
-            if update.rawInput.file_path then f:write("  rawInput.file_path=" .. tostring(update.rawInput.file_path) .. "\n") end
-            if update.rawInput.path then f:write("  rawInput.path=" .. tostring(update.rawInput.path) .. "\n") end
-          else
-            f:write("  rawInput=nil\n")
-          end
-          if update.locations then
-            f:write("  locations=" .. vim.inspect(update.locations) .. "\n")
-          end
-          f:write("  session_ctx exists=" .. tostring(opts.session_ctx ~= nil) .. "\n")
-          if opts.session_ctx then
-            f:write("  session_ctx.edited_files=" .. vim.inspect(vim.tbl_keys(opts.session_ctx.edited_files or {})) .. "\n")
-          end
-          f:write("\n")
-          f:close()
-        end
-      end
       Utils.debug("llm.lua on_session_update: sessionUpdate=" .. tostring(update.sessionUpdate))
       if update.sessionUpdate == "plan" then
             -- Store plan entries in session state
@@ -1383,8 +1300,6 @@ function M._stream_acp(opts)
               end)
             end
 
-            -- Track file edits for /files command
-            track_acp_file_edit(update)
           end
 
           if update.sessionUpdate == "tool_call_update" then
@@ -1426,8 +1341,6 @@ function M._stream_acp(opts)
             if tool_result_message then table.insert(messages, tool_result_message) end
             on_messages_add(messages)
 
-            -- Track file edits for /files command
-            track_acp_file_edit(update)
           end
 
           if update.sessionUpdate == "available_commands_update" then
@@ -1669,7 +1582,7 @@ function M._stream_acp(opts)
       local ok, Avante = pcall(require, "avante")
       if ok and Avante.register_acp_client then Avante.register_acp_client(client_id, acp_client) end
 
-      -- If we create a new client and it does not support sesion loading,
+      -- If we create a new client and it does not support session loading,
       -- remove the old session
       if not acp_client.agent_capabilities.loadSession then opts.acp_session_id = nil end
       if opts.on_save_acp_client then opts.on_save_acp_client(acp_client) end
@@ -1678,12 +1591,10 @@ function M._stream_acp(opts)
       if not session_id then
         M._create_acp_session_and_continue(opts, acp_client)
       else
-        if opts.just_connect_acp_client then return end
-
-        -- Load existing session to sync external changes
+        -- Load existing session first (even for early-connect), then only prompt if needed
         if acp_client.agent_capabilities.loadSession and opts._load_existing_session then
           M._load_and_continue_acp_session(opts, acp_client, session_id)
-        else
+        elseif not opts.just_connect_acp_client then
           -- Set flag for first prompt even when reusing session
           opts._is_first_session_prompt = true
           M._continue_stream_acp(opts, acp_client, session_id)
@@ -1696,18 +1607,16 @@ function M._stream_acp(opts)
     -- This ensures fresh closures over get_history_messages, on_messages_add, etc.
     acp_client.config.handlers = handlers
   end
-  
+
   if not session_id then
     M._create_acp_session_and_continue(opts, acp_client)
     return
   end
 
-  if opts.just_connect_acp_client then return end
-
-  -- Load existing session to sync external changes
+  -- Load existing session first (even for early-connect), then only prompt if needed
   if acp_client.agent_capabilities.loadSession and opts._load_existing_session then
     M._load_and_continue_acp_session(opts, acp_client, session_id)
-  else
+  elseif not opts.just_connect_acp_client then
     -- Set flag for first prompt even in fallthrough path
     opts._is_first_session_prompt = true
     M._continue_stream_acp(opts, acp_client, session_id)
@@ -1748,30 +1657,58 @@ function M._load_and_continue_acp_session(opts, acp_client, session_id)
   acp_client:load_session(session_id, project_root, {}, function(result, err)
     if err then
       Utils.warn("Failed to load ACP session: " .. vim.inspect(err))
-      -- Fall back to continuing without loading
-      M._continue_stream_acp(opts, acp_client, session_id)
+      -- Clear load flag even on error to prevent re-triggering
+      opts._load_existing_session = false
+      if opts.sidebar then opts.sidebar._load_existing_session = false end
       -- Trigger callback even on error
       if opts._on_session_load_complete then
         vim.schedule(function()
           opts._on_session_load_complete()
         end)
       end
+      -- Fall back to continuing without loading (only if we have a prompt to send)
+      if not opts.just_connect_acp_client then
+        M._continue_stream_acp(opts, acp_client, session_id)
+      end
       return
     end
-    
+
     Utils.info("ACP session loaded successfully, synced with external changes")
-    
-    -- Mark this as session recovery to preserve context
-    opts._is_session_recovery = true
-    
+
+    -- Clear the load flag so subsequent prompts don't re-trigger session/load
+    opts._load_existing_session = false
+    -- Also clear on the sidebar so the flag doesn't persist across submits
+    if opts.sidebar then opts.sidebar._load_existing_session = false end
+
+    -- NOTE: Do NOT set _is_session_recovery here. After a successful session/load,
+    -- the agent already knows the full conversation history. Setting _is_session_recovery
+    -- would cause _continue_stream_acp to re-send all history messages in the prompt,
+    -- which the agent interprets as a new conversation (creating a duplicate).
+    -- _is_session_recovery should only be set in the "Session not found" recovery path
+    -- where we create a brand new session and need to replay context.
+
+    -- Initialize modes from the loaded session (session/load returns modes like session/new)
+    -- Skip setting default mode — the loaded session already has its own mode
+    if opts.sidebar then
+      vim.schedule(function()
+        opts.sidebar:initialize_modes({ skip_set_default_mode = true })
+        opts.sidebar:ensure_acp_thread()
+        opts.sidebar:render_result()
+        opts.sidebar:show_input_hint()
+      end)
+    end
+
     -- Trigger callback after session load completes
     if opts._on_session_load_complete then
       vim.schedule(function()
         opts._on_session_load_complete()
       end)
     end
-    
-    M._continue_stream_acp(opts, acp_client, session_id)
+
+    -- Only send prompt if this isn't just an early-connect
+    if not opts.just_connect_acp_client then
+      M._continue_stream_acp(opts, acp_client, session_id)
+    end
   end)
 end
 

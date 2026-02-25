@@ -179,6 +179,27 @@ local TOOL_ICONS = {
   ExitPlanMode    = { icon = "🗺️",  verb = "exited plan mode" },
 }
 
+--- Parse MCP-style tool names (e.g. "mcp__chrome-devtools__take_snapshot")
+--- into a formatted display name (e.g. "MCP Chrome DevTools — take snapshot")
+---@param name string
+---@return string|nil formatted_name  nil if not an MCP tool name
+local function parse_mcp_tool_name(name)
+  if not name or not name:match("^mcp__") then return nil end
+  local parts = vim.split(name, "__")
+  if #parts < 3 then return nil end
+  -- parts[1] = "mcp", parts[2] = server name, parts[3+] = tool name
+  local server = parts[2]
+  -- Convert kebab-case server name to Title Case
+  local server_display = server:gsub("(%a)([%w]*)", function(first, rest)
+    return first:upper() .. rest
+  end):gsub("-", " ")
+  -- Join remaining parts as the tool name, replace underscores with spaces
+  local tool_parts = {}
+  for i = 3, #parts do table.insert(tool_parts, parts[i]) end
+  local tool_display = table.concat(tool_parts, " "):gsub("_", " ")
+  return "MCP " .. server_display .. " — " .. tool_display
+end
+
 --- Get the compact description for a tool call (emoji + verb + param)
 ---@param tool_name string  The raw tool name (e.g., "Read", "Edit", "Bash")
 ---@param item table  The tool_use content item
@@ -188,6 +209,15 @@ local function get_tool_compact_info(tool_name, item, message)
   local info = TOOL_ICONS[tool_name]
   local icon = info and info.icon or "🔧"
   local verb = info and info.verb or tool_name:lower()
+
+  -- Format MCP tool names nicely
+  if not info then
+    local mcp_name = parse_mcp_tool_name(tool_name)
+    if mcp_name then
+      icon = "🧰"
+      verb = mcp_name
+    end
+  end
 
   -- Extract the most relevant parameter for a short description
   local param
@@ -450,6 +480,9 @@ function M.get_tool_display_name(message)
     native_tool_name = message.acp_tool_call.title or "Other"
   end
   if message.acp_tool_call and message.acp_tool_call.title then native_tool_name = message.acp_tool_call.title end
+  -- Format MCP tool names for display
+  local mcp_display = parse_mcp_tool_name(native_tool_name)
+  if mcp_display then native_tool_name = mcp_display end
   local tool_name = native_tool_name
   if message.displayed_tool_name then
     tool_name = message.displayed_tool_name
