@@ -493,6 +493,52 @@ function AcpThread:_add_tool_call_message(update)
   return message
 end
 
+--- Track file edits from an ACP tool call update (shared by tool_call and tool_call_update)
+---@param update avante.acp.ToolCallUpdate
+function AcpThread:_track_file_edit(update)
+  local ChangedFiles = require("avante.changed_files")
+  -- tool_call_update may not carry title/kind — fall back to the stored tool call message
+  local stored = self.tool_call_messages[update.toolCallId]
+  local stored_acp = stored and stored.acp_tool_call or {}
+  local tool_title = update.title or stored_acp.title or ""
+  local tool_kind = update.kind or stored_acp.kind or ""
+
+  local is_write_tool = tool_kind == "edit" or tool_kind == "delete" or tool_kind == "move"
+  if not is_write_tool then
+    for _, name in ipairs(ChangedFiles.ACP_WRITE_TOOL_TITLES) do
+      if tool_title == name or tool_title:match("^" .. vim.pesc(name) .. "[^%w]") then
+        is_write_tool = true
+        break
+      end
+    end
+  end
+  if not is_write_tool then return end
+
+  local raw = update.rawInput or {}
+  local path = raw.file_path or raw.path or raw.rel_path or raw.filepath
+  if not path and update.locations and #update.locations > 0 then
+    path = update.locations[1].path
+  end
+  -- Also try to extract path from the title (e.g. "Write(src/foo.lua)" or "Edit(src/foo.lua)")
+  if not path then
+    local title_path = tool_title:match("^%w+%((.+)%)$")
+    if title_path then path = title_path end
+  end
+  if not path then return end
+
+  vim.schedule(function()
+    local sidebar = require("avante").get()
+    if not sidebar or not sidebar._current_session_ctx then return end
+    local abs_path = vim.fn.fnamemodify(path, ":p")
+    local Helpers = require("avante.llm_tools.helpers")
+    if update.status == "pending" or update.status == "in_progress" then
+      Helpers.snapshot_file_for_review(abs_path, sidebar._current_session_ctx)
+    elseif update.status == "completed" then
+      Helpers.track_edited_file(abs_path, sidebar._current_session_ctx, tool_title)
+    end
+  end)
+end
+
 ---@param update avante.acp.ToolCallUpdate
 function AcpThread:_handle_tool_call(update)
   self:_add_tool_call_message(update)
@@ -520,6 +566,9 @@ function AcpThread:_handle_tool_call(update)
       self:_update_todos_from_tool(todos_input)
     end
   end
+
+  -- Track file edits (some tools arrive already completed in the initial tool_call)
+  self:_track_file_edit(update)
 end
 
 ---@param update avante.acp.ToolCallUpdate
@@ -591,48 +640,10 @@ function AcpThread:_handle_tool_call_update(update)
   end
 
   -- Track file edits from ACP tool calls for the changed files list
-  local ChangedFiles = require("avante.changed_files")
-  local tool_title = update.title or ""
-  local tool_kind = update.kind or ""
-  local is_write_tool = tool_kind == "edit" or tool_kind == "delete" or tool_kind == "move"
-  if not is_write_tool then
-    for _, name in ipairs(ChangedFiles.ACP_WRITE_TOOL_TITLES) do
-      if tool_title == name or tool_title:match("^" .. vim.pesc(name) .. "[^%w]") then
-        is_write_tool = true
-        break
-      end
-    end
-  end
-  if is_write_tool then
-    local raw = update.rawInput or {}
-    local path = raw.file_path or raw.path or raw.rel_path or raw.filepath
-    if not path and update.locations and #update.locations > 0 then
-      path = update.locations[1].path
-    end
-    -- Also try to extract path from the title (e.g. "Write(src/foo.lua)" or "Edit(src/foo.lua)")
-    if not path then
-      local title_path = tool_title:match("^%w+%((.+)%)$")
-      if title_path then path = title_path end
-    end
-    if path then
-      vim.schedule(function()
-        local sidebar = require("avante").get()
-        if sidebar and sidebar._current_session_ctx then
-          local abs_path = vim.fn.fnamemodify(path, ":p")
-          local Helpers = require("avante.llm_tools.helpers")
-          if update.status == "pending" or update.status == "in_progress" then
-            -- Snapshot before the edit completes
-            Helpers.snapshot_file_for_review(abs_path, sidebar._current_session_ctx)
-          elseif update.status == "completed" then
-            -- Track the completed edit
-            Helpers.track_edited_file(abs_path, sidebar._current_session_ctx, tool_title)
-          end
-        end
-      end)
-    end
-  end
+  self:_track_file_edit(update)
 
   -- Intercept TodoWrite tool call updates to populate the plan container
+  local tool_title = update.title or ""
   if tool_title:match("TodoWrite") or tool_title:match("write_todos") then
     local raw = update.rawInput or {}
     local todos_input = raw.todos

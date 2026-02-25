@@ -62,13 +62,14 @@ end
 ---@param session_id string
 ---@param stop_opts table Stop options with reason and optional error
 ---@param task_summary string|nil Brief description of the task
-function M.on_agent_complete(session_id, stop_opts, task_summary)
+---@param thread_title string|nil Title of the thread (shown in notification for pinned threads)
+function M.on_agent_complete(session_id, stop_opts, task_summary, thread_title)
   local Config = require("avante.config")
-  
+
   if not Config.notifications.enabled then return end
   if not M.notification_available then return end
   if not stop_opts then return end
-  
+
   -- Check if we should notify for this event type
   local should_notify = false
   if stop_opts.reason == "complete" and Config.notifications.notify_on_complete then
@@ -78,15 +79,15 @@ function M.on_agent_complete(session_id, stop_opts, task_summary)
   elseif stop_opts.reason == "cancelled" and Config.notifications.notify_on_cancel then
     should_notify = true
   end
-  
+
   if not should_notify then return end
-  
+
   -- Calculate duration
   local duration = M._calculate_duration(session_id)
-  
+
   -- Build notification message
-  local title, message = M._format_message(task_summary, duration, stop_opts, Config)
-  
+  local title, message = M._format_message(task_summary, duration, stop_opts, Config, thread_title)
+
   -- Send notification asynchronously
   M._send_notification_async(title, message)
 end
@@ -115,21 +116,23 @@ end
 ---@param duration number|nil
 ---@param stop_opts table
 ---@param config table
+---@param thread_title string|nil
 ---@return string title
 ---@return string message
-function M._format_message(task_summary, duration, stop_opts, config)
+function M._format_message(task_summary, duration, stop_opts, config, thread_title)
   local title
   local message = ""
-  
-  -- Determine title based on reason
+
+  -- Determine title based on reason, include thread title if available
+  local suffix = thread_title and (" - " .. thread_title) or ""
   if stop_opts.reason == "complete" then
-    title = "Avante Agent Complete ✓"
+    title = "Avante Complete" .. suffix
   elseif stop_opts.error then
-    title = "Avante Agent Error ✗"
+    title = "Avante Error" .. suffix
   elseif stop_opts.reason == "cancelled" then
-    title = "Avante Agent Cancelled"
+    title = "Avante Cancelled" .. suffix
   else
-    title = "Avante Agent"
+    title = "Avante Agent" .. suffix
   end
   
   -- Add duration if available and enabled

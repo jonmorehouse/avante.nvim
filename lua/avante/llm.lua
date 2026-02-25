@@ -1299,6 +1299,7 @@ function M._stream_acp(opts)
                 vim.g.avante_last_auto_nav = now
               end)
             end
+
           end
 
           if update.sessionUpdate == "tool_call_update" then
@@ -1339,6 +1340,7 @@ function M._stream_acp(opts)
             local messages = { tool_call_message }
             if tool_result_message then table.insert(messages, tool_result_message) end
             on_messages_add(messages)
+
           end
 
           if update.sessionUpdate == "available_commands_update" then
@@ -1517,6 +1519,13 @@ function M._stream_acp(opts)
         end,
         on_write_file = function(path, content, callback)
           local abs_path = Utils.to_absolute_path(path)
+
+          -- Snapshot file before write for /files tracking
+          if opts.session_ctx then
+            local Helpers = require("avante.llm_tools.helpers")
+            Helpers.snapshot_file_for_review(abs_path, opts.session_ctx)
+          end
+
           local file = io.open(abs_path, "w")
           if file then
             file:write(content)
@@ -1532,6 +1541,13 @@ function M._stream_acp(opts)
             for _, buf in ipairs(buffers) do
               vim.api.nvim_buf_call(buf, function() vim.cmd("edit") end)
             end
+
+            -- Track the edit for /files
+            if opts.session_ctx then
+              local Helpers = require("avante.llm_tools.helpers")
+              Helpers.track_edited_file(abs_path, opts.session_ctx, "Write")
+            end
+
             callback(nil)
             return
           end
@@ -1566,7 +1582,7 @@ function M._stream_acp(opts)
       local ok, Avante = pcall(require, "avante")
       if ok and Avante.register_acp_client then Avante.register_acp_client(client_id, acp_client) end
 
-      -- If we create a new client and it does not support sesion loading,
+      -- If we create a new client and it does not support session loading,
       -- remove the old session
       if not acp_client.agent_capabilities.loadSession then opts.acp_session_id = nil end
       if opts.on_save_acp_client then opts.on_save_acp_client(acp_client) end
@@ -1575,12 +1591,10 @@ function M._stream_acp(opts)
       if not session_id then
         M._create_acp_session_and_continue(opts, acp_client)
       else
-        if opts.just_connect_acp_client then return end
-
-        -- Load existing session to sync external changes
+        -- Load existing session first (even for early-connect), then only prompt if needed
         if acp_client.agent_capabilities.loadSession and opts._load_existing_session then
           M._load_and_continue_acp_session(opts, acp_client, session_id)
-        else
+        elseif not opts.just_connect_acp_client then
           -- Set flag for first prompt even when reusing session
           opts._is_first_session_prompt = true
           M._continue_stream_acp(opts, acp_client, session_id)
@@ -1593,18 +1607,16 @@ function M._stream_acp(opts)
     -- This ensures fresh closures over get_history_messages, on_messages_add, etc.
     acp_client.config.handlers = handlers
   end
-  
+
   if not session_id then
     M._create_acp_session_and_continue(opts, acp_client)
     return
   end
 
-  if opts.just_connect_acp_client then return end
-
-  -- Load existing session to sync external changes
+  -- Load existing session first (even for early-connect), then only prompt if needed
   if acp_client.agent_capabilities.loadSession and opts._load_existing_session then
     M._load_and_continue_acp_session(opts, acp_client, session_id)
-  else
+  elseif not opts.just_connect_acp_client then
     -- Set flag for first prompt even in fallthrough path
     opts._is_first_session_prompt = true
     M._continue_stream_acp(opts, acp_client, session_id)
@@ -1645,30 +1657,58 @@ function M._load_and_continue_acp_session(opts, acp_client, session_id)
   acp_client:load_session(session_id, project_root, {}, function(result, err)
     if err then
       Utils.warn("Failed to load ACP session: " .. vim.inspect(err))
-      -- Fall back to continuing without loading
-      M._continue_stream_acp(opts, acp_client, session_id)
+      -- Clear load flag even on error to prevent re-triggering
+      opts._load_existing_session = false
+      if opts.sidebar then opts.sidebar._load_existing_session = false end
       -- Trigger callback even on error
       if opts._on_session_load_complete then
         vim.schedule(function()
           opts._on_session_load_complete()
         end)
       end
+      -- Fall back to continuing without loading (only if we have a prompt to send)
+      if not opts.just_connect_acp_client then
+        M._continue_stream_acp(opts, acp_client, session_id)
+      end
       return
     end
-    
+
     Utils.info("ACP session loaded successfully, synced with external changes")
-    
-    -- Mark this as session recovery to preserve context
-    opts._is_session_recovery = true
-    
+
+    -- Clear the load flag so subsequent prompts don't re-trigger session/load
+    opts._load_existing_session = false
+    -- Also clear on the sidebar so the flag doesn't persist across submits
+    if opts.sidebar then opts.sidebar._load_existing_session = false end
+
+    -- NOTE: Do NOT set _is_session_recovery here. After a successful session/load,
+    -- the agent already knows the full conversation history. Setting _is_session_recovery
+    -- would cause _continue_stream_acp to re-send all history messages in the prompt,
+    -- which the agent interprets as a new conversation (creating a duplicate).
+    -- _is_session_recovery should only be set in the "Session not found" recovery path
+    -- where we create a brand new session and need to replay context.
+
+    -- Initialize modes from the loaded session (session/load returns modes like session/new)
+    -- Skip setting default mode — the loaded session already has its own mode
+    if opts.sidebar then
+      vim.schedule(function()
+        opts.sidebar:initialize_modes({ skip_set_default_mode = true })
+        opts.sidebar:ensure_acp_thread()
+        opts.sidebar:render_result()
+        opts.sidebar:show_input_hint()
+      end)
+    end
+
     -- Trigger callback after session load completes
     if opts._on_session_load_complete then
       vim.schedule(function()
         opts._on_session_load_complete()
       end)
     end
-    
-    M._continue_stream_acp(opts, acp_client, session_id)
+
+    -- Only send prompt if this isn't just an early-connect
+    if not opts.just_connect_acp_client then
+      M._continue_stream_acp(opts, acp_client, session_id)
+    end
   end)
 end
 
