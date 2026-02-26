@@ -166,6 +166,36 @@ function History.save_latest_filename(bufnr, filename)
   metadata_filepath:write(vim.json.encode(metadata), "w")
 end
 
+---Save last-session info to metadata (working directory, selected files)
+---@param bufnr integer
+---@param session_info { working_directory?: string, selected_files?: string[] }
+function History.save_last_session(bufnr, session_info)
+  local metadata_filepath = History.get_metadata_filepath(bufnr)
+  local metadata = {}
+  if metadata_filepath:exists() then
+    local ok, content = pcall(function() return metadata_filepath:read() end)
+    if ok and content then
+      local dok, decoded = pcall(vim.json.decode, content)
+      if dok then metadata = decoded end
+    end
+  end
+  metadata.last_session = session_info
+  metadata_filepath:write(vim.json.encode(metadata), "w")
+end
+
+---Load last-session info from metadata
+---@param bufnr integer
+---@return { working_directory?: string, selected_files?: string[] } | nil
+function History.load_last_session(bufnr)
+  local metadata_filepath = History.get_metadata_filepath(bufnr)
+  if not metadata_filepath:exists() then return nil end
+  local ok, content = pcall(function() return metadata_filepath:read() end)
+  if not ok or not content then return nil end
+  local dok, metadata = pcall(vim.json.decode, content)
+  if not dok or not metadata then return nil end
+  return metadata.last_session
+end
+
 ---@param bufnr integer
 function History.new(bufnr)
   local filepath = History.get_latest_filepath(bufnr, true)

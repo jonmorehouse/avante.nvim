@@ -16,7 +16,6 @@ local LLMTools = require("avante.llm_tools")
 local History = require("avante.history")
 local HistoryRender = require("avante.history.render")
 local ACPConfirmAdapter = require("avante.ui.acp_confirm_adapter")
-local EnvUtils = require("avante.utils.environment")
 
 ---@class avante.LLM
 local M = {}
@@ -1555,161 +1554,37 @@ function M._stream_acp(opts)
         end,
   }
   
-  -- Create new client if needed
+  -- ACP client and session must be established by Sidebar:connect_acp() before prompting
   if not acp_client then
-    -- Get current working directory and resolve environment variables with path-based overrides
-    local cwd = vim.fn.getcwd()
-    local resolved_env = EnvUtils.merge_env_with_overrides(
-      acp_provider.env or {},
-      acp_provider.envOverrides,
-      cwd
-    )
-    
-    local acp_config = vim.tbl_deep_extend("force", acp_provider, {
-      handlers = handlers,
-      env = resolved_env,
-    })
-    acp_client = ACPClient:new(acp_config)
-
-    acp_client:connect(function(conn_err)
-      if conn_err then
-        opts.on_stop({ reason = "error", error = conn_err })
-        return
-      end
-
-      -- Register ACP client for global cleanup on exit (Fix Issue #2749)
-      local client_id = "acp_" .. tostring(acp_client) .. "_" .. os.time()
-      local ok, Avante = pcall(require, "avante")
-      if ok and Avante.register_acp_client then Avante.register_acp_client(client_id, acp_client) end
-
-      -- If we create a new client and it does not support session loading,
-      -- remove the old session
-      if not acp_client.agent_capabilities.loadSession then opts.acp_session_id = nil end
-      if opts.on_save_acp_client then opts.on_save_acp_client(acp_client) end
-
-      session_id = opts.acp_session_id
-      if not session_id then
-        M._create_acp_session_and_continue(opts, acp_client)
-      else
-        -- Load existing session first (even for early-connect), then only prompt if needed
-        if acp_client.agent_capabilities.loadSession and opts._load_existing_session then
-          M._load_and_continue_acp_session(opts, acp_client, session_id)
-        elseif not opts.just_connect_acp_client then
-          -- Set flag for first prompt even when reusing session
-          opts._is_first_session_prompt = true
-          M._continue_stream_acp(opts, acp_client, session_id)
-        end
-      end
-    end)
+    opts.on_stop({ reason = "error", error = "ACP client not connected. Call connect_acp() first." })
     return
-  else
-    -- CRITICAL FIX: Update handlers when reusing existing client
-    -- This ensures fresh closures over get_history_messages, on_messages_add, etc.
-    acp_client.config.handlers = handlers
   end
 
   if not session_id then
-    M._create_acp_session_and_continue(opts, acp_client)
+    opts.on_stop({ reason = "error", error = "No ACP session ID. Call connect_acp() first." })
     return
   end
 
-  -- Load existing session first (even for early-connect), then only prompt if needed
-  if acp_client.agent_capabilities.loadSession and opts._load_existing_session then
-    M._load_and_continue_acp_session(opts, acp_client, session_id)
-  elseif not opts.just_connect_acp_client then
-    -- Set flag for first prompt even in fallthrough path
-    opts._is_first_session_prompt = true
-    M._continue_stream_acp(opts, acp_client, session_id)
+  -- Update handlers on the existing client — ensures fresh closures for this prompt
+  acp_client.config.handlers = handlers
+
+  -- Determine if this is the first prompt to the session (for title extraction)
+  -- Check if history has no user messages yet — indicates this is the first prompt
+  if not rawget(opts, "_is_first_session_prompt") then
+    local history_msgs = opts.history_messages or {}
+    local has_user_msg = false
+    for _, msg in ipairs(history_msgs) do
+      if msg.message and msg.message.role == "user" then
+        has_user_msg = true
+        break
+      end
+    end
+    if not has_user_msg then
+      opts._is_first_session_prompt = true
+    end
   end
-end
 
----@param opts AvanteLLMStreamOptions
----@param acp_client avante.acp.ACPClient
-function M._create_acp_session_and_continue(opts, acp_client)
-  local project_root = Utils.root.get()
-  acp_client:create_session(project_root, {}, function(session_id_, err)
-    if err then
-      opts.on_stop({ reason = "error", error = err })
-      return
-    end
-    if not session_id_ then
-      opts.on_stop({ reason = "error", error = "Failed to create session" })
-      return
-    end
-    opts.acp_session_id = session_id_
-    if opts.on_save_acp_session_id then opts.on_save_acp_session_id(session_id_) end
-
-    if opts.just_connect_acp_client then return end
-    -- Mark this as the first prompt to the new session for proper title extraction
-    opts._is_first_session_prompt = true
-    M._continue_stream_acp(opts, acp_client, session_id_)
-  end)
-end
-
----Load existing ACP session and continue (to sync external changes)
----@param opts AvanteLLMStreamOptions
----@param acp_client avante.acp.ACPClient
----@param session_id string
-function M._load_and_continue_acp_session(opts, acp_client, session_id)
-  local project_root = Utils.root.get()
-  Utils.info("Loading ACP session to sync external changes: " .. session_id)
-  
-  acp_client:load_session(session_id, project_root, {}, function(result, err)
-    if err then
-      Utils.warn("Failed to load ACP session: " .. vim.inspect(err))
-      -- Clear load flag even on error to prevent re-triggering
-      opts._load_existing_session = false
-      if opts.sidebar then opts.sidebar._load_existing_session = false end
-      -- Trigger callback even on error
-      if opts._on_session_load_complete then
-        vim.schedule(function()
-          opts._on_session_load_complete()
-        end)
-      end
-      -- Fall back to continuing without loading (only if we have a prompt to send)
-      if not opts.just_connect_acp_client then
-        M._continue_stream_acp(opts, acp_client, session_id)
-      end
-      return
-    end
-
-    Utils.info("ACP session loaded successfully, synced with external changes")
-
-    -- Clear the load flag so subsequent prompts don't re-trigger session/load
-    opts._load_existing_session = false
-    -- Also clear on the sidebar so the flag doesn't persist across submits
-    if opts.sidebar then opts.sidebar._load_existing_session = false end
-
-    -- NOTE: Do NOT set _is_session_recovery here. After a successful session/load,
-    -- the agent already knows the full conversation history. Setting _is_session_recovery
-    -- would cause _continue_stream_acp to re-send all history messages in the prompt,
-    -- which the agent interprets as a new conversation (creating a duplicate).
-    -- _is_session_recovery should only be set in the "Session not found" recovery path
-    -- where we create a brand new session and need to replay context.
-
-    -- Initialize modes from the loaded session (session/load returns modes like session/new)
-    -- Skip setting default mode — the loaded session already has its own mode
-    if opts.sidebar then
-      vim.schedule(function()
-        opts.sidebar:initialize_modes({ skip_set_default_mode = true })
-        opts.sidebar:ensure_acp_thread()
-        opts.sidebar:render_result()
-        opts.sidebar:show_input_hint()
-      end)
-    end
-
-    -- Trigger callback after session load completes
-    if opts._on_session_load_complete then
-      vim.schedule(function()
-        opts._on_session_load_complete()
-      end)
-    end
-
-    -- Only send prompt if this isn't just an early-connect
-    if not opts.just_connect_acp_client then
-      M._continue_stream_acp(opts, acp_client, session_id)
-    end
-  end)
+  M._continue_stream_acp(opts, acp_client, session_id)
 end
 
 ---@param opts AvanteLLMStreamOptions
@@ -2079,19 +1954,12 @@ function M._continue_stream_acp(opts, acp_client, session_id)
         -- Mark recovery attempt to prevent infinite loops
         rawset(opts, "_session_recovery_attempted", true)
 
-        -- DEBUG: Log recovery attempt
-        Utils.debug("Session recovery attempt detected, setting _session_recovery_attempted flag")
+        Utils.debug("Session recovery: session not found, will create new via connect_acp")
 
-        -- Clear invalid session ID
-        if opts.on_save_acp_session_id then
-          opts.on_save_acp_session_id("") -- Use empty string instead of nil
+        -- Clear invalid session ID on sidebar
+        if opts.sidebar and opts.sidebar.chat_history then
+          opts.sidebar.chat_history.acp_session_id = nil
         end
-
-        -- Clear invalid session for recovery - let global cleanup handle ACP processes
-        vim.schedule(function()
-          opts.acp_client = nil
-          opts.acp_session_id = nil
-        end)
 
         -- CRITICAL: Preserve full history for better context retention
         -- Only truncate if explicitly configured to do so, otherwise keep full history
@@ -2163,23 +2031,25 @@ function M._continue_stream_acp(opts, acp_client, session_id)
           -- Update UI state if available
           if opts.on_state_change then opts.on_state_change("generating") end
 
-          -- CRITICAL: Ensure history messages are preserved in recovery
           Utils.info("Session recovery retry with " .. #(opts.history_messages or {}) .. " history messages")
 
-          -- DEBUG: Log recovery history details
-          local recovery_history = opts.history_messages or {}
-          Utils.debug("Recovery history messages: " .. #recovery_history)
-          for i, msg in ipairs(recovery_history) do
-            if msg and msg.message then
-              Utils.debug("Recovery msg " .. i .. ": role=" .. (msg.message.role or "unknown"))
-              if msg.message.role == "assistant" then
-                Utils.debug("Recovery assistant content: " .. tostring(msg.message.content):sub(1, 100))
-              end
-            end
+          -- Use connect_acp to create a new session, then retry the stream
+          if opts.sidebar then
+            opts.sidebar:connect_acp({
+              force_new = true,
+              on_ready = function()
+                -- Update opts with the new client and session_id
+                opts.acp_client = opts.sidebar.acp_client
+                opts.acp_session_id = opts.sidebar.chat_history and opts.sidebar.chat_history.acp_session_id
+                rawset(opts, "_is_session_recovery", true)
+                rawset(opts, "_session_recovery_attempted", nil)
+                M._stream_acp(opts)
+              end,
+            })
+          else
+            -- No sidebar — can't recover
+            opts.on_stop({ reason = "error", error = "Session expired and no sidebar available for recovery" })
           end
-
-          -- Retry with truncated history to rebuild context in new session
-          M._stream_acp(opts)
         end)
 
         -- CRITICAL: Return immediately to prevent further processing in fast event context

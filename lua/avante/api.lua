@@ -154,9 +154,15 @@ function M.ask(opts)
     if sidebar and sidebar:is_open() and sidebar.code.bufnr ~= vim.api.nvim_get_current_buf() then
       sidebar:close({ goto_code_win = false })
     end
-    require("avante").open_sidebar(opts)
+    -- Skip ACP connect and session restore on open if new_chat — new_thread() handles everything
+    local open_opts = vim.tbl_extend("force", opts, {})
+    if new_chat then
+      open_opts.skip_acp_connect = true
+      open_opts.skip_session_restore = true
+    end
+    require("avante").open_sidebar(open_opts)
     sidebar = require("avante").get()
-    if new_chat then sidebar:new_chat() end
+    if new_chat then sidebar:new_thread() end
     if opts.without_selection then
       sidebar.code.selection = nil
       sidebar.file_selector:reset()
@@ -286,7 +292,6 @@ local function make_thread_open_callback(buf)
       if not require("avante").is_sidebar_open() then require("avante").open_sidebar({ skip_acp_connect = true }) end
       local Path = require("avante.path")
       local Utils = require("avante.utils")
-      local Config = require("avante.config")
       local sidebar = require("avante").get()
 
       -- Change to the thread's working directory first (critical for cross-project threads)
@@ -306,43 +311,10 @@ local function make_thread_open_callback(buf)
         sidebar:reload_chat_history()
         sidebar.chat_history.acp_session_id = external_session_id
         if wd then sidebar.chat_history.working_directory = wd end
-
         Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
         Path.history.save_latest_filename(sidebar.code.bufnr, sidebar.chat_history.filename)
-
-        if Config.acp_providers[Config.provider] then
-          Utils.info("Loading external ACP session...")
-          -- Bump generation to invalidate any in-flight callbacks from prior session
-          sidebar._acp_session_generation = (sidebar._acp_session_generation or 0) + 1
-          sidebar.acp_client = nil
-          sidebar._on_session_load_complete = function()
-            -- Do NOT reload_chat_history() — it reads from disk and may lose the session_id.
-            -- chat_history is already correct in memory with the external session_id.
-            sidebar:update_content_with_history()
-            sidebar:create_plan_container()
-            sidebar:initialize_token_count()
-            if sidebar.chat_history then
-              sidebar.chat_history.last_seen_message_count = #(sidebar.chat_history.messages or {})
-              Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
-            end
-            vim.schedule(function() sidebar:focus_input() end)
-            sidebar._on_session_load_complete = nil
-          end
-          vim.schedule(function()
-            sidebar._load_existing_session = true
-            sidebar:handle_submit("")
-          end)
-        else
-          sidebar:update_content_with_history()
-          sidebar:create_plan_container()
-          sidebar:initialize_token_count()
-          vim.schedule(function() sidebar:focus_input() end)
-        end
-        return
-      end
-
-      -- Handle regular Avante history — use the history object directly if available
-      if history then
+      elseif history then
+        -- Handle regular Avante history — use the history object directly
         sidebar.chat_history = history
         Path.history.save(sidebar.code.bufnr, history)
         Path.history.save_latest_filename(sidebar.code.bufnr, history.filename)
@@ -351,54 +323,31 @@ local function make_thread_open_callback(buf)
         sidebar:reload_chat_history()
       end
 
+      -- Restore selected files from history
       local loaded_history = sidebar.chat_history
-      if loaded_history and loaded_history.acp_session_id then
-        -- Restore selected files from history
-        if loaded_history.selected_files and sidebar.file_selector then
-          sidebar.file_selector.selected_files = {}
-          for _, filepath in ipairs(loaded_history.selected_files) do
-            sidebar.file_selector:add_selected_file(filepath)
-          end
+      if loaded_history and loaded_history.selected_files and sidebar.file_selector then
+        sidebar.file_selector.selected_files = {}
+        for _, filepath in ipairs(loaded_history.selected_files) do
+          sidebar.file_selector:add_selected_file(filepath)
         end
-
-        if Config.acp_providers[Config.provider] then
-          Utils.info("Loading ACP session to sync external changes...")
-          -- Bump generation to invalidate any in-flight callbacks from prior session
-          sidebar._acp_session_generation = (sidebar._acp_session_generation or 0) + 1
-          sidebar.acp_client = nil
-          sidebar._on_session_load_complete = function()
-            -- Do NOT reload_chat_history() — it reads from disk and may lose the session_id
-            -- if the project root changed. chat_history is already correct in memory.
-            sidebar:update_content_with_history()
-            sidebar:create_plan_container()
-            sidebar:initialize_token_count()
-            if sidebar.chat_history then
-              sidebar.chat_history.last_seen_message_count = #(sidebar.chat_history.messages or {})
-              Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
-            end
-            vim.schedule(function() sidebar:focus_input() end)
-            sidebar._on_session_load_complete = nil
-          end
-          vim.schedule(function()
-            sidebar._load_existing_session = true
-            sidebar:handle_submit("")
-          end)
-        else
-          sidebar:update_content_with_history()
-          sidebar:create_plan_container()
-          sidebar:initialize_token_count()
-          vim.schedule(function() sidebar:focus_input() end)
-        end
-      else
-        if loaded_history then
-          loaded_history.last_seen_message_count = #(loaded_history.messages or {})
-          Path.history.save(sidebar.code.bufnr, loaded_history)
-        end
-        sidebar:update_content_with_history()
-        sidebar:create_plan_container()
-        sidebar:initialize_token_count()
-        vim.schedule(function() sidebar:focus_input() end)
       end
+
+      if loaded_history then
+        loaded_history.last_seen_message_count = #(loaded_history.messages or {})
+        Path.history.save(sidebar.code.bufnr, loaded_history)
+      end
+
+      -- Update UI
+      sidebar:update_content_with_history()
+      sidebar:create_plan_container()
+      sidebar:initialize_token_count()
+
+      -- Connect ACP — will load existing session if acp_session_id present, or create new
+      sidebar:connect_acp({
+        on_ready = function()
+          vim.schedule(function() sidebar:focus_input() end)
+        end,
+      })
     end)
   end
 end
@@ -488,10 +437,10 @@ local function open_new_chat_in_dir(dir, title)
   vim.cmd("cd " .. vim.fn.fnameescape(dir))
   Utils.info("Changed directory to: " .. dir)
 
-  require("avante").open_sidebar({})
+  require("avante").open_sidebar({ skip_acp_connect = true, skip_session_restore = true })
   local sidebar = require("avante").get()
   if sidebar then
-    sidebar:new_chat()
+    sidebar:new_thread()
     if title and sidebar.chat_history then
       sidebar.chat_history.title = title
       Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
@@ -719,69 +668,22 @@ function M.request_plan_mode()
   Utils.info("Requested agent to enter plan mode")
 end
 
--- Session management functions
-function M.save_session()
-  local sidebar = require("avante").get()
-  if not sidebar then
-    require("avante.utils").warn("No active sidebar to save")
-    return
-  end
-  local SessionManager = require("avante.session_manager")
-  if SessionManager.save_session(sidebar) then
-    require("avante.utils").info("Session saved successfully")
-  else
-    require("avante.utils").error("Failed to save session")
-  end
-end
-
+--- Restore session — now simply opens sidebar which auto-restores last thread
 function M.restore_session()
-  local sidebar = require("avante").get()
-  if not sidebar then
-    require("avante.api").ask()
-    sidebar = require("avante").get()
-  end
-
-  local SessionManager = require("avante.session_manager")
-  local session_state = SessionManager.load_session(sidebar.code.bufnr)
-  if not session_state then
-    require("avante.utils").warn("No saved session found for this project")
-    return
-  end
-
-  SessionManager.restore_session(sidebar, session_state)
-end
-
-function M.delete_session()
-  local bufnr = vim.api.nvim_get_current_buf()
-  local SessionManager = require("avante.session_manager")
-  if SessionManager.delete_session(bufnr) then
-    require("avante.utils").info("Session deleted")
+  local avante = require("avante")
+  if not avante.is_sidebar_open() then
+    avante.open_sidebar({})
   else
-    require("avante.utils").warn("No session found to delete")
-  end
-end
-
-function M.list_sessions()
-  local SessionManager = require("avante.session_manager")
-  local sessions = SessionManager.list_sessions()
-
-  if vim.tbl_count(sessions) == 0 then
-    require("avante.utils").info("No saved sessions")
-    return
-  end
-
-  print("Saved sessions:")
-  for project_root, session in pairs(sessions) do
-    print(string.format("  %s - %s (%s)",
-      vim.fn.fnamemodify(project_root, ":t"),
-      session.timestamp,
-      session.provider
-    ))
+    -- Sidebar already open — reconnect ACP to restore session
+    local sidebar = avante.get()
+    if sidebar then
+      sidebar:connect_acp()
+    end
   end
 end
 
 --- Restore an ACP session by its session ID.
---- Creates/connects an ACP client, calls session/load, and wires up the sidebar.
+--- Connects to ACP agent and loads the specified session.
 --- Works even without local Avante history cache.
 ---@param session_id string The ACP session ID to restore
 function M.restore_acp_session(session_id)
@@ -803,13 +705,6 @@ function M.restore_acp_session(session_id)
     return
   end
 
-  -- Bump session generation to invalidate any in-flight callbacks from prior session/new
-  sidebar._acp_session_generation = (sidebar._acp_session_generation or 0) + 1
-
-  -- Reset client so a fresh one connects and loads the session
-  sidebar.acp_client = nil
-  sidebar.acp_thread = nil
-
   -- Set up chat_history with the session ID and persist to disk
   local Path = require("avante.path")
   if not sidebar.chat_history then
@@ -818,21 +713,15 @@ function M.restore_acp_session(session_id)
   sidebar.chat_history.acp_session_id = session_id
   Path.history.save(sidebar.code.bufnr, sidebar.chat_history)
 
-  -- Set the load flag and callback
-  sidebar._load_existing_session = true
-  sidebar._on_session_load_complete = function()
-    -- Do NOT reload_chat_history() here — it reads from disk and may lose
-    -- the in-memory session_id if the project root changed or metadata is stale.
-    -- The chat_history is already correct in memory.
-    sidebar:update_content_with_history()
-    sidebar:create_plan_container()
-    sidebar:initialize_token_count()
-    vim.schedule(function() sidebar:focus_input() end)
-    sidebar._on_session_load_complete = nil
-  end
-
   Utils.info("Restoring ACP session: " .. session_id)
-  sidebar:handle_submit("")
+  sidebar:connect_acp({
+    on_ready = function()
+      sidebar:update_content_with_history()
+      sidebar:create_plan_container()
+      sidebar:initialize_token_count()
+      vim.schedule(function() sidebar:focus_input() end)
+    end,
+  })
 end
 
 function M.add_buffer_files()

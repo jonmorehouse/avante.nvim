@@ -215,36 +215,24 @@ function Sidebar:open(opts)
     vim.g.avante_login = true
   end
 
-  -- Check for saved session and offer to restore
+  -- Auto-restore last thread's session info (working dir, selected files)
   if not opts.skip_session_restore then
-    vim.schedule(function()
-      local SessionManager = require("avante.session_manager")
-      if SessionManager.has_session(self.code.bufnr) then
-        local choice = vim.fn.confirm(
-          "Found a saved session for this project. Restore it?",
-          "&Yes\n&No",
-          1
-        )
-        if choice == 1 then
-          local session_state = SessionManager.load_session(self.code.bufnr)
-          if session_state then
-            SessionManager.restore_session(self, session_state)
-          end
-        else
-          -- Delete the session since user doesn't want it
-          SessionManager.delete_session(self.code.bufnr)
+    local last_session = Path.history.load_last_session(self.code.bufnr)
+    if last_session then
+      if last_session.working_directory and vim.fn.isdirectory(last_session.working_directory) == 1 then
+        vim.cmd("cd " .. vim.fn.fnameescape(last_session.working_directory))
+      end
+      if last_session.selected_files and self.file_selector then
+        for _, filepath in ipairs(last_session.selected_files) do
+          self.file_selector:add_selected_file(filepath)
         end
       end
-    end)
+    end
   end
 
-  local acp_provider = Config.acp_providers[Config.provider]
-  if acp_provider and not opts.skip_acp_connect then
-    -- If we have a persisted session, flag it for loading on connect
-    if self.chat_history and self.chat_history.acp_session_id then
-      self._load_existing_session = true
-    end
-    self:handle_submit("")
+  -- Connect to ACP agent — uses chat_history.acp_session_id to load or create
+  if not opts.skip_acp_connect then
+    self:connect_acp()
   end
 
   return self
@@ -528,16 +516,207 @@ function Sidebar:ensure_acp_thread()
   return self.acp_thread
 end
 
+--- Connect to ACP agent and either load an existing session or create a new one.
+--- This is the single entry point for all ACP session lifecycle management.
+---@param opts? { on_ready?: fun(), force_new?: boolean }
+function Sidebar:connect_acp(opts)
+  opts = opts or {}
+  local acp_provider = Config.acp_providers[Config.provider]
+  if not acp_provider then
+    if opts.on_ready then opts.on_ready() end
+    return
+  end
+
+  local ACPClient = require("avante.libs.acp_client")
+  local EnvUtils = require("avante.utils.environment")
+
+  -- Bump session generation to invalidate any in-flight callbacks from prior session
+  self._acp_session_generation = (self._acp_session_generation or 0) + 1
+  local my_generation = self._acp_session_generation
+
+  -- Disconnect existing client if switching sessions
+  if self.acp_client then
+    pcall(function() self.acp_client:disconnect() end)
+  end
+  self.acp_client = nil
+  self.acp_thread = nil
+
+  -- Placeholder handlers — will be replaced by llm.lua before sending prompts
+  local handlers = {
+    on_session_update = function(_update) end,
+    on_request_permission = function(_tool_call, _options, _callback) end,
+    on_read_file = function(path, _line, _limit, callback, error_callback)
+      local abs_path = Utils.to_absolute_path(path)
+      local lines, err, errname = Utils.read_file_from_buf_or_disk(abs_path)
+      if err then
+        if error_callback then
+          local code = errname == "ENOENT" and ACPClient.ERROR_CODES.RESOURCE_NOT_FOUND or nil
+          error_callback(err, code)
+        end
+        return
+      end
+      callback(table.concat(lines or {}, "\n"))
+    end,
+    on_write_file = function(path, content, callback)
+      local abs_path = Utils.to_absolute_path(path)
+      local file = io.open(abs_path, "w")
+      if file then
+        file:write(content)
+        file:close()
+        callback(nil)
+      else
+        callback("Failed to write file: " .. abs_path)
+      end
+    end,
+  }
+
+  local cwd = vim.fn.getcwd()
+  local resolved_env = EnvUtils.merge_env_with_overrides(
+    acp_provider.env or {},
+    acp_provider.envOverrides,
+    cwd
+  )
+
+  local acp_config = vim.tbl_deep_extend("force", acp_provider, {
+    handlers = handlers,
+    env = resolved_env,
+  })
+  local acp_client = ACPClient:new(acp_config)
+
+  acp_client:connect(function(conn_err)
+    -- Guard against stale callbacks
+    if (self._acp_session_generation or 0) ~= my_generation then return end
+
+    if conn_err then
+      Utils.error("ACP connect failed: " .. tostring(conn_err))
+      return
+    end
+
+    -- Register for global cleanup on exit
+    local client_id = "acp_" .. tostring(acp_client) .. "_" .. os.time()
+    local ok, Avante = pcall(require, "avante")
+    if ok and Avante.register_acp_client then Avante.register_acp_client(client_id, acp_client) end
+
+    self.acp_client = acp_client
+
+    local existing_session_id = self.chat_history and self.chat_history.acp_session_id
+    local has_existing = existing_session_id and not opts.force_new
+
+    if has_existing then
+      -- We have an existing session ID — try to resume it
+      local can_load = acp_client.agent_capabilities and acp_client.agent_capabilities.loadSession
+
+      if can_load then
+        -- Agent supports session/load — use it
+        local project_root = Utils.root.get()
+        Utils.info("Loading ACP session: " .. existing_session_id)
+        acp_client:load_session(existing_session_id, project_root, {}, function(_result, err)
+          if (self._acp_session_generation or 0) ~= my_generation then return end
+          if err then
+            -- session/load failed — keep the existing session ID and proceed anyway.
+            -- The agent process may still have this session active; we'll find out
+            -- when we send the first prompt.
+            Utils.warn("Failed to load ACP session: " .. vim.inspect(err) .. " — will try existing session")
+          else
+            Utils.info("ACP session loaded: " .. existing_session_id)
+          end
+
+          vim.schedule(function()
+            if (self._acp_session_generation or 0) ~= my_generation then return end
+            self:initialize_modes({ skip_set_default_mode = true })
+            self:ensure_acp_thread()
+            self:render_result()
+            self:show_input_hint()
+            if opts.on_ready then opts.on_ready() end
+          end)
+        end)
+      else
+        -- Agent doesn't support session/load — just keep the existing session ID
+        -- and proceed. The session may still be active in the agent process.
+        Utils.info("Resuming ACP session: " .. existing_session_id)
+        vim.schedule(function()
+          if (self._acp_session_generation or 0) ~= my_generation then return end
+          self:initialize_modes({ skip_set_default_mode = true })
+          self:ensure_acp_thread()
+          self:render_result()
+          self:show_input_hint()
+          if opts.on_ready then opts.on_ready() end
+        end)
+      end
+    else
+      -- No existing session or force_new — create a new one
+      self:_create_acp_session(acp_client, my_generation, opts)
+    end
+  end)
+end
+
+--- Internal: create a new ACP session after client is connected
+---@param acp_client avante.acp.ACPClient
+---@param generation number
+---@param opts { on_ready?: fun(), force_new?: boolean }
+function Sidebar:_create_acp_session(acp_client, generation, opts)
+  local project_root = Utils.root.get()
+  acp_client:create_session(project_root, {}, function(session_id, err)
+    if (self._acp_session_generation or 0) ~= generation then return end
+    if err then
+      Utils.error("Failed to create ACP session: " .. tostring(err))
+      return
+    end
+    if not session_id then
+      Utils.error("Failed to create ACP session: no session ID returned")
+      return
+    end
+
+    -- Save session ID to chat history
+    if self.chat_history then
+      self.chat_history.acp_session_id = session_id
+      -- Auto-tag with provider info on first session creation
+      if not self.chat_history.tags or #self.chat_history.tags == 0 then
+        self.chat_history.tags = {}
+        local provider = Config.provider or "unknown"
+        table.insert(self.chat_history.tags, provider)
+        local cwd = vim.fn.fnamemodify(vim.fn.getcwd(), ":t")
+        if cwd and cwd ~= "" then
+          table.insert(self.chat_history.tags, cwd)
+        end
+      end
+      Path.history.save(self.code.bufnr, self.chat_history)
+    end
+
+    vim.schedule(function()
+      if (self._acp_session_generation or 0) ~= generation then return end
+      self:initialize_modes()
+      self:ensure_acp_thread()
+      self:render_result()
+      self:show_input_hint()
+      if opts.on_ready then opts.on_ready() end
+    end)
+  end)
+end
+
 --- Create a new thread, resetting the sidebar for a fresh conversation.
 --- Auto-tags the thread with provider and project info.
+--- Connects ACP with force_new to create a fresh session.
 function Sidebar:new_thread()
   -- Reset sidebar state
   self.acp_thread = nil
   self.current_mode_id = nil
   self.available_modes = {}
 
-  -- Create fresh history
-  local Path = require("avante.path")
+  -- Reset file selector to clean state
+  if self.file_selector then
+    self.file_selector:reset()
+    if Config.behaviour.auto_add_current_file and self.code.bufnr and api.nvim_buf_is_valid(self.code.bufnr) then
+      local buf_path = api.nvim_buf_get_name(self.code.bufnr)
+      if buf_path ~= "" and not buf_path:match("^%w+://") then
+        local filepath = Utils.file.is_in_project(buf_path) and Utils.relative_path(buf_path) or buf_path
+        local stat = vim.uv.fs_stat(filepath)
+        if stat == nil or stat.type == "file" then self.file_selector:add_selected_file(filepath) end
+      end
+    end
+  end
+
+  -- Create fresh history (no acp_session_id — connect_acp will create new)
   self.chat_history = Path.history.new(self.code.bufnr)
 
   -- Auto-tag with provider info
@@ -551,18 +730,25 @@ function Sidebar:new_thread()
   Path.history.save(self.code.bufnr, self.chat_history)
 
   -- Clear UI
-  self:clear_state()
+  self.current_state = nil
+  self.expanded_message_uuids = {}
+  self.tool_message_positions = {}
+  self.current_tool_use_extmark_id = nil
+  self._current_session_ctx = nil
+  self:update_content_with_history()
   self:render_result()
   self:show_input_hint()
+
+  -- Connect ACP — force_new since this is a brand new thread
+  self:connect_acp({ force_new = true })
 
   Utils.debug("Created new thread: " .. self.chat_history.filename)
 end
 
 --- Load an existing thread by session_id or filename.
+--- Connects ACP to load or create session based on thread's acp_session_id.
 ---@param opts { session_id?: string, filename?: string }
 function Sidebar:load_thread(opts)
-  local Path = require("avante.path")
-
   if opts.filename then
     self.chat_history = Path.history.load(self.code.bufnr, opts.filename)
   elseif opts.session_id then
@@ -583,19 +769,17 @@ function Sidebar:load_thread(opts)
     end
   end
 
-  -- Reset thread state — will be re-created on next ensure_acp_thread
+  -- Reset thread state — will be re-created by connect_acp
   self.acp_thread = nil
   self.current_mode_id = nil
   self.available_modes = {}
 
-  -- Set flag to load session on next submit
-  if self.chat_history.acp_session_id then
-    self._load_existing_session = true
-  end
-
   -- Update UI
   self:render_result()
   self:show_input_hint()
+
+  -- Connect ACP — will load existing session if acp_session_id present
+  self:connect_acp()
 
   Utils.debug("Loaded thread: " .. (self.chat_history.filename or "unknown"))
 end
@@ -642,17 +826,22 @@ function Sidebar:fork_thread()
 
   Utils.info("Forked thread: " .. forked.filename)
 
-  -- Prompt user for what to do with this fork
-  vim.schedule(function()
-    vim.ui.input({ prompt = "What would you like to do with this fork? " }, function(input)
-      if not input or input == "" then return end
-      -- Write the prompt into the input buffer and submit
-      if self.containers and self.containers.input and vim.api.nvim_buf_is_valid(self.containers.input.bufnr) then
-        vim.api.nvim_buf_set_lines(self.containers.input.bufnr, 0, -1, false, vim.split(input, "\n"))
-        self:handle_submit(input)
-      end
-    end)
-  end)
+  -- Connect ACP — fork has no session_id, force_new creates a fresh session
+  self:connect_acp({
+    force_new = true,
+    on_ready = function()
+      -- Prompt user for what to do with this fork
+      vim.schedule(function()
+        vim.ui.input({ prompt = "What would you like to do with this fork? " }, function(input)
+          if not input or input == "" then return end
+          if self.containers and self.containers.input and vim.api.nvim_buf_is_valid(self.containers.input.bufnr) then
+            vim.api.nvim_buf_set_lines(self.containers.input.bufnr, 0, -1, false, vim.split(input, "\n"))
+            self:handle_submit(input)
+          end
+        end)
+      end)
+    end,
+  })
 end
 
 --- Rename the current thread.
@@ -2282,12 +2471,15 @@ function Sidebar:initialize()
   -- Only auto-add current file if configured to do so
   if Config.behaviour.auto_add_current_file then
     local buf_path = api.nvim_buf_get_name(self.code.bufnr)
-    -- if the filepath is outside of the current working directory then we want the absolute path
-    local filepath = Utils.file.is_in_project(buf_path) and Utils.relative_path(buf_path) or buf_path
-    Utils.debug("Sidebar:initialize adding buffer to file selector", buf_path)
+    -- Skip virtual/special buffer schemes (fern://, fugitive://, oil://, etc.)
+    if buf_path ~= "" and not buf_path:match("^%w+://") then
+      -- if the filepath is outside of the current working directory then we want the absolute path
+      local filepath = Utils.file.is_in_project(buf_path) and Utils.relative_path(buf_path) or buf_path
+      Utils.debug("Sidebar:initialize adding buffer to file selector", buf_path)
 
-    local stat = vim.uv.fs_stat(filepath)
-    if stat == nil or stat.type == "file" then self.file_selector:add_selected_file(filepath) end
+      local stat = vim.uv.fs_stat(filepath)
+      if stat == nil or stat.type == "file" then self.file_selector:add_selected_file(filepath) end
+    end
   end
 
   self:reload_chat_history()
@@ -2859,6 +3051,24 @@ function Sidebar:compact_history_messages(args, cb)
 end
 
 function Sidebar:new_chat(args, cb)
+  -- Reset mode state
+  self.current_mode_id = nil
+  self.available_modes = {}
+  self.acp_thread = nil
+
+  -- Reset file selector to clean state
+  if self.file_selector then
+    self.file_selector:reset()
+    if Config.behaviour.auto_add_current_file and self.code.bufnr and api.nvim_buf_is_valid(self.code.bufnr) then
+      local buf_path = api.nvim_buf_get_name(self.code.bufnr)
+      if buf_path ~= "" and not buf_path:match("^%w+://") then
+        local filepath = Utils.file.is_in_project(buf_path) and Utils.relative_path(buf_path) or buf_path
+        local stat = vim.uv.fs_stat(filepath)
+        if stat == nil or stat.type == "file" then self.file_selector:add_selected_file(filepath) end
+      end
+    end
+  end
+
   local history = Path.history.new(self.code.bufnr)
   -- Auto-detect worktree name if cwd is inside a git worktree
   local wd = history.working_directory or vim.fn.getcwd()
@@ -2894,6 +3104,8 @@ function Sidebar:new_chat(args, cb)
   vim.schedule(function()
     vim.api.nvim_win_call(self.containers.result.winid, function() vim.cmd("normal! ggG") end)
   end)
+  -- Connect ACP for new chat — creates a fresh session
+  self:connect_acp({ force_new = true })
   if cb then cb(args) end
   vim.schedule(function() self:create_plan_container() end)
 end
@@ -2905,6 +3117,11 @@ local debounced_save_history = Utils.debounce(
       self.chat_history.selected_files = self.file_selector:get_selected_filepaths()
     end
     Path.history.save(self.code.bufnr, self.chat_history)
+    -- Persist last-session info for auto-restore on next open
+    Path.history.save_last_session(self.code.bufnr, {
+      working_directory = vim.fn.getcwd(),
+      selected_files = self.chat_history.selected_files or {},
+    })
   end,
   1000
 )
@@ -3617,6 +3834,9 @@ end
 
 ---@param request string
 function Sidebar:handle_submit(request)
+  -- Empty requests were previously used to trigger ACP connect — now handled by connect_acp()
+  if request == "" then return end
+
   if Config.prompt_logger.enabled then
     local metadata = self:collect_prompt_metadata()
     PromptLogger.log_prompt_v2(request, metadata)
@@ -3887,9 +4107,6 @@ function Sidebar:handle_submit(request)
     local session_generation = self._acp_session_generation or 0
 
     local stream_options = vim.tbl_deep_extend("force", generate_prompts_options, {
-      just_connect_acp_client = request == "",
-      _load_existing_session = self._load_existing_session or false,
-      _on_session_load_complete = self._on_session_load_complete,
       on_start = on_start,
       on_stop = on_stop,
       on_tool_log = on_tool_log,
@@ -3897,39 +4114,7 @@ function Sidebar:handle_submit(request)
       on_state_change = on_state_change,
       sidebar = self,
       acp_client = self.acp_client,
-      on_save_acp_client = function(client)
-        -- Guard against stale callbacks from prior session attempts
-        if (self._acp_session_generation or 0) ~= session_generation then return end
-        self.acp_client = client
-        -- Note: modes are initialized after session creation, not here
-        -- Ensure AcpThread is created/synced
-        self:ensure_acp_thread()
-      end,
       acp_session_id = self.chat_history.acp_session_id,
-      on_save_acp_session_id = function(session_id)
-        -- Guard against stale callbacks from prior session attempts (e.g. restore overwrote)
-        if (self._acp_session_generation or 0) ~= session_generation then return end
-        self.chat_history.acp_session_id = session_id
-        -- Auto-tag with provider info on first session creation
-        if not self.chat_history.tags or #self.chat_history.tags == 0 then
-          self.chat_history.tags = {}
-          local provider = Config.provider or "unknown"
-          table.insert(self.chat_history.tags, provider)
-          local cwd = vim.fn.fnamemodify(vim.fn.getcwd(), ":t")
-          if cwd and cwd ~= "" then
-            table.insert(self.chat_history.tags, cwd)
-          end
-        end
-        Path.history.save(self.code.bufnr, self.chat_history)
-        -- Clear the load flag after saving
-        self._load_existing_session = false
-        -- Initialize modes after session is created (modes come from session/new response)
-        self:initialize_modes()
-        -- Sync AcpThread with new session
-        self:ensure_acp_thread()
-        self:render_result()
-        self:show_input_hint()
-      end,
       set_tool_use_store = set_tool_use_store,
       get_history_messages = function(opts) return self:get_history_messages_for_api(opts) end,
       get_todos = function()
@@ -4625,6 +4810,7 @@ function Sidebar:create_plan_container()
         modifiable = true,
         swapfile = false,
         buftype = "acwrite",
+        buflisted = false,
         bufhidden = "wipe",
         filetype = "markdown",
       }),
@@ -4647,19 +4833,25 @@ function Sidebar:create_plan_container()
       return
     end
 
-    -- Set up BufWriteCmd for editable plan
     local plan_bufnr = api.nvim_win_get_buf(self.containers.plan.winid)
+
+    -- Name the buffer so :wall doesn't fail with E141 (unnamed acwrite buffer)
+    api.nvim_buf_set_name(plan_bufnr, "avante://plan")
+
+    local function send_plan()
+      local buf_lines = api.nvim_buf_get_lines(plan_bufnr, 0, -1, false)
+      local edited_plan = self:parse_plan_buffer(buf_lines)
+      self:send_plan_feedback(edited_plan)
+      vim.bo[plan_bufnr].modified = false
+    end
+
+    -- :w on the plan buffer sends plan feedback
     api.nvim_create_autocmd("BufWriteCmd", {
       buffer = plan_bufnr,
-      callback = function()
-        local buf_lines = api.nvim_buf_get_lines(plan_bufnr, 0, -1, false)
-        local edited_plan = self:parse_plan_buffer(buf_lines)
-        self:send_plan_feedback(edited_plan)
-        vim.bo[plan_bufnr].modified = false
-      end,
+      callback = send_plan,
     })
 
-    -- CR in normal mode toggles checkbox state
+    -- CR in normal mode toggles checkbox state and sends feedback
     vim.keymap.set("n", "<CR>", function()
       local row = api.nvim_win_get_cursor(self.containers.plan.winid)[1]
       local cur_line = api.nvim_buf_get_lines(plan_bufnr, row - 1, row, false)[1] or ""
@@ -4673,8 +4865,12 @@ function Sidebar:create_plan_container()
       end
       if new_line then
         api.nvim_buf_set_lines(plan_bufnr, row - 1, row, false, { new_line })
+        send_plan()
       end
     end, { buffer = plan_bufnr, noremap = true, silent = true, desc = "Toggle plan checkbox" })
+
+    -- C-s sends plan feedback from any mode
+    vim.keymap.set({ "n", "i" }, "<C-s>", send_plan, { buffer = plan_bufnr, noremap = true, silent = true, desc = "Send plan feedback" })
   end
 
   -- Render plan content as markdown checkboxes
